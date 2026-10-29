@@ -123,10 +123,14 @@ final class RecorderVM: ObservableObject {
         detection?.models.first { $0.id == id }?.name ?? id
     }
 
+    func modelLabel(_ id: String) -> String {
+        detection?.models.first { $0.id == id }?.label ?? id
+    }
+
     /// 菜单里的一行: 「自动 · GPT-6-Luna」或具体模型名
     func describe(_ choice: String, auto: String?) -> String {
-        guard choice == "auto" else { return modelName(choice) }
-        if let auto { return "自动 · \(modelName(auto))" }
+        guard choice == "auto" else { return modelLabel(choice) }
+        if let auto { return "自动 · \(modelLabel(auto))" }
         return detecting ? "自动 · 检测中…" : "自动"
     }
 
@@ -191,7 +195,15 @@ final class RecorderVM: ObservableObject {
 }
 
 struct Detection: Decodable {
-    struct Model: Decodable, Hashable { let id: String; let name: String; let provider: String }
+    struct Model: Decodable, Hashable {
+        let id: String
+        let name: String
+        let provider: String
+        let tier: String?        // 快 / 均衡 / 最强…, 未知型号为空
+        let recommended: Bool    // 默认勾进下拉
+        let enabled: Bool        // 按已保存的勾选(没勾过就是推荐)
+        var label: String { tier.map { "\(name) · \($0)" } ?? name }
+    }
     struct Channel: Decodable { let via: String?; let note: String }
     struct Auto: Decodable {
         let draft: String?
@@ -241,9 +253,12 @@ struct SettingsView: View {
     @State private var draftTyped = ""
     @State private var finalTyped = ""
     @State private var status = ""
+    @State private var savedEnabled: String?       // 设置文件里的勾选(没勾过为空)
+    @State private var editedEnabled: Set<String>?  // 本次在「管理」里改过的勾选
+    @State private var showLibrary = false
 
     private static let typedTag = "__typed__"
-    private static let groups = [("GPT", "codex"), ("Claude", "claude"), ("其他 AI", "custom")]
+    static let groups = [("GPT", "codex"), ("Claude", "claude"), ("其他 AI", "custom")]
     // 常见的 OpenAI 兼容接口: (名称, 接口地址, 申请 API key 的网址)
     private static let presets = [
         ("Kimi（月之暗面）", "https://api.moonshot.cn/v1", "https://platform.moonshot.cn"),
@@ -276,13 +291,25 @@ struct SettingsView: View {
                         Button("重新检测") { vm.detect() }.disabled(vm.detecting)
                     }
                 }
+                LabeledContent("下拉里的模型") {
+                    HStack {
+                        Text("已选 \(enabledIDs.count) 个 / 共检测到 \(vm.detection?.models.count ?? 0) 个")
+                            .foregroundStyle(.secondary)
+                        Button("管理…") { showLibrary = true }.disabled(vm.detection?.models.isEmpty ?? true)
+                    }
+                }
                 modelPicker("清稿 / 提纲", choice: $draftChoice, typed: $draftTyped, auto: vm.detection?.auto.draft)
                 modelPicker("最终纪要", choice: $finalChoice, typed: $finalTyped, auto: vm.detection?.auto.finalModel)
             } header: {
                 Text("模型")
             } footer: {
-                Text("不确定就选「自动」：每次开录前检查这台 Mac 能用哪些 AI，清稿挑快的、纪要挑最强的。")
+                Text("下拉只列你勾选的模型（默认是各家快→强的几档），其余收在「管理…」里。"
+                     + "不确定就选「自动」：清稿挑快的、纪要挑最强的，也只在勾选的模型里挑。")
                     .foregroundStyle(.secondary)
+            }
+            .sheet(isPresented: $showLibrary) {
+                ModelLibrary(models: vm.detection?.models ?? [], enabled: Binding(
+                    get: { enabledIDs }, set: { editedEnabled = $0 }))
             }
             Section("纪要与录音") {
                 LabeledContent("保存位置") {
@@ -381,19 +408,19 @@ struct SettingsView: View {
     @ViewBuilder
     private func modelPicker(_ title: String, choice: Binding<String>, typed: Binding<String>,
                              auto: String?) -> some View {
-        let models = vm.detection?.models ?? []
+        let models = (vm.detection?.models ?? []).filter { enabledIDs.contains($0.id) }
         let current = choice.wrappedValue
         Picker(title, selection: choice) {
-            Text(auto.map { "自动（推荐）· \(vm.modelName($0))" } ?? "自动（推荐）").tag("auto")
+            Text(auto.map { "自动（推荐）· \(vm.modelLabel($0))" } ?? "自动（推荐）").tag("auto")
             // 设置里存的模型这次没检测到(比如退出了登录), 仍列出来, 不让选择凭空消失
             if current != "auto", current != Self.typedTag, !models.contains(where: { $0.id == current }) {
-                Text("\(current)（本次未检测到）").tag(current)
+                Text("\(vm.modelName(current))（不在下拉清单里）").tag(current)
             }
             ForEach(Self.groups, id: \.1) { label, provider in
                 let group = models.filter { $0.provider == provider }
                 if !group.isEmpty {
                     Section(label) {
-                        ForEach(group, id: \.self) { Text($0.name).tag($0.id) }
+                        ForEach(group, id: \.self) { Text($0.label).tag($0.id) }
                     }
                 }
             }
@@ -411,9 +438,16 @@ struct SettingsView: View {
         openaiKey = cfg["openai_api_key"] ?? ""
         anthropicKey = cfg["anthropic_api_key"] ?? ""
         customEnv = cfg["custom_env"] ?? ""
+        savedEnabled = cfg["enabled_models"]
+        editedEnabled = nil
         draftChoice = cfg["draft_model"] ?? "auto"
         finalChoice = cfg["final_model"] ?? "auto"
         status = ""
+    }
+
+    /// 下拉里显示的模型: 本次改过的勾选优先, 否则用检测结果(已含保存过的勾选)
+    private var enabledIDs: Set<String> {
+        editedEnabled ?? Set((vm.detection?.models ?? []).filter(\.enabled).map(\.id))
     }
 
     private func resolved(_ choice: String, _ typed: String) -> String {
@@ -437,6 +471,9 @@ struct SettingsView: View {
             try MeetCapConfig.save(["output_dir": outputDir, "speaker": speaker,
                                     "openai_api_key": openaiKey, "anthropic_api_key": anthropicKey,
                                     "custom_env": customEnv,
+                                    // 一个都不勾时存 "-", 否则空值会被当成「没勾过」而回到推荐
+                                    "enabled_models": editedEnabled.map { $0.isEmpty ? "-" : $0.sorted().joined(separator: ",") }
+                                        ?? savedEnabled ?? "",
                                     "draft_model": resolved(draftChoice, draftTyped),
                                     "final_model": resolved(finalChoice, finalTyped)])
             vm.reloadConfig()
@@ -446,6 +483,56 @@ struct SettingsView: View {
         } catch {
             status = "保存失败：\(error.localizedDescription)"
         }
+    }
+}
+
+/// 「管理…」: 检测到的全部模型, 勾选哪些进下拉; 模型多时可搜索
+struct ModelLibrary: View {
+    let models: [Detection.Model]
+    @Binding var enabled: Set<String>
+    @Environment(\.dismiss) private var dismiss
+    @State private var query = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("下拉里显示哪些模型").font(.headline)
+            Text("只有勾选的模型会出现在清稿 / 纪要的下拉里，「自动」也只在勾选的里面挑。")
+                .font(.callout).foregroundStyle(.secondary)
+            TextField("搜索模型", text: $query).textFieldStyle(.roundedBorder)
+            List {
+                ForEach(SettingsView.groups, id: \.1) { label, provider in
+                    let rows = models.filter { $0.provider == provider && matches($0) }
+                    if !rows.isEmpty {
+                        Section(label) {
+                            ForEach(rows, id: \.self) { m in
+                                Toggle(isOn: Binding(
+                                    get: { enabled.contains(m.id) },
+                                    set: { on in if on { enabled.insert(m.id) } else { enabled.remove(m.id) } })) {
+                                    HStack {
+                                        Text(m.label)
+                                        Spacer()
+                                        if m.name != m.id { Text(m.id).font(.caption).foregroundStyle(.tertiary) }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            .frame(height: 340)
+            HStack {
+                Button("只留推荐") { enabled = Set(models.filter(\.recommended).map(\.id)) }
+                Spacer()
+                Text("已选 \(enabled.count) 个").foregroundStyle(.secondary)
+                Button("完成") { dismiss() }.keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 480)
+    }
+
+    private func matches(_ m: Detection.Model) -> Bool {
+        query.isEmpty || m.name.localizedCaseInsensitiveContains(query) || m.id.localizedCaseInsensitiveContains(query)
     }
 }
 

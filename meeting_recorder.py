@@ -44,10 +44,16 @@ CONFIG_FILE = Path.home() / "Library" / "Application Support" / "MeetCap" / "con
 # Claude CLI 的模型别名始终指向各档最新版, 不必随发版改名
 CLAUDE_ALIASES = {"haiku", "sonnet", "opus", "fable"}
 CODEX_CACHE = Path.home() / ".codex" / "models_cache.json"  # codex 登录后自动维护的可用模型清单
-CODEX_FALLBACK = [("gpt-6-luna", "GPT-6-Luna"), ("gpt-6.1-terra", "GPT-6.1 Terra"),
-                  ("gpt-6.1-sol", "GPT-6.1-Sol"), ("gpt-6-astra", "GPT-6-Astra")]
-CLAUDE_CLI_MODELS = [("haiku", "Claude Haiku(最新)"), ("sonnet", "Claude Sonnet(最新)"),
-                     ("opus", "Claude Opus(最新)"), ("fable", "Claude Fable(最新)")]
+CODEX_FALLBACK = [("gpt-6-luna", "GPT-6 Luna"), ("gpt-6.1-terra", "GPT-6.1 Terra"),
+                  ("gpt-6.1-sol", "GPT-6.1 Sol"), ("gpt-6-astra", "GPT-6 Astra")]
+CLAUDE_CLI_MODELS = [("haiku", "Claude Haiku"), ("sonnet", "Claude Sonnet"),
+                     ("opus", "Claude Opus"), ("fable", "Claude Fable")]
+# 推荐档位(快→强): 默认勾进下拉并按此排序; 其余检测到的模型收在「可选模型」里, 用户自己勾
+TIERS = {
+    "gpt-6-luna": "快", "gpt-6.1-terra": "均衡", "gpt-6.1-sol": "主力", "gpt-6-astra": "最强",
+    "haiku": "快", "sonnet": "均衡", "opus": "深入", "fable": "最强",
+    "claude-haiku-5-5": "快", "claude-sonnet-5-5": "均衡", "claude-opus-5-5": "深入", "claude-fable-5-1": "最强",
+}
 # 模型选「自动」时的挑选顺序: 清稿/提纲要快, 终稿要强; 都不可用时取检测到的第一个
 AUTO = "auto"
 AUTO_PREFS = {
@@ -110,7 +116,9 @@ def list_models(provider: str, via: str, key: str | None) -> list[tuple[str, str
             return CODEX_FALLBACK
         shown = sorted((m for m in cached if m.get("visibility") == "list"),
                        key=lambda m: m.get("priority", 99))
-        return [(m["slug"], m.get("display_name") or m["slug"]) for m in shown] or CODEX_FALLBACK
+        # 统一写法: Codex 清单里 "GPT-6.1-Sol" 与 "GPT-6.1 Terra" 混用
+        return [(m["slug"], re.sub(r"^(GPT-[\d.]+)-", r"\1 ", m.get("display_name") or m["slug"]))
+                for m in shown] or CODEX_FALLBACK
     if via == "cli":
         return CLAUDE_CLI_MODELS
     if provider == "custom":
@@ -155,11 +163,28 @@ def detect_models(cfg: dict) -> dict:
             except Exception as exc:
                 via, note = None, f"{note}不可用({type(exc).__name__})"
         channels[provider] = {"via": via, "note": note}
-        models += [{"id": i, "name": n, "provider": provider} for i, n in found]
-    ids = [m["id"] for m in models]
-    # 偏好清单里都没有(例如只配了其他 AI): 取第一家的第一个做清稿、最后一个做终稿,
-    # 所以 MODELS 按「快的,强的」顺序写
-    first = [m["id"] for m in models if m["provider"] == models[0]["provider"]] if models else [None]
+        # 推荐档位排前面(快→强), 其余保持接口给的顺序
+        order = list(TIERS)
+        found.sort(key=lambda m: order.index(m[0]) if m[0] in TIERS else len(order))
+        explicit = provider == "custom" and keys["custom"].get("MODELS")
+        for i, (mid, name) in enumerate(found):
+            tier = TIERS.get(mid)
+            if explicit and len(found) > 1 and i in (0, len(found) - 1):
+                tier = "快" if i == 0 else "最强"  # 求助提示要求 MODELS 按「快的,强的」写
+            # 默认进下拉的: 推荐档位; 用户在 MODELS 里点名的; 都没有时该家前 3 个
+            recommended = bool(tier) or bool(explicit) or (
+                not any(TIERS.get(f[0]) for f in found) and i < 3)
+            models.append({"id": mid, "name": name, "provider": provider,
+                           "tier": tier, "recommended": recommended})
+    # 用户在「可选模型」里勾过就以勾选为准, 否则用推荐; 「自动」也只在勾选的模型里挑
+    chosen = cfg.get("enabled_models")
+    picked = set(chosen.split(",")) if chosen else None
+    for m in models:
+        m["enabled"] = m["id"] in picked if picked is not None else m["recommended"]
+    pool = [m for m in models if m["enabled"]] or models
+    ids = [m["id"] for m in pool]
+    # 偏好清单里都没有(例如只配了其他 AI): 取第一家的第一个做清稿、最后一个做终稿
+    first = [m["id"] for m in pool if m["provider"] == pool[0]["provider"]] if pool else [None]
     fallback = {"draft": first[0], "final": first[-1]}
     auto = {stage: next((m for m in prefs if m in ids), fallback[stage])
             for stage, prefs in AUTO_PREFS.items()}
