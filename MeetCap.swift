@@ -16,27 +16,12 @@ final class RecorderVM: ObservableObject {
     @Published var lastSession: URL?
     @AppStorage("recordMic") var recordMic = true  // 是否同时录自己的麦克风
     @AppStorage("onsite") var onsite = false        // 现场会模式: 麦克风为主轨
-    @AppStorage("draftModel") var draftModel = RecorderVM.defaultDraft
-    @AppStorage("finalModel") var finalModel = RecorderVM.defaultFinal
     @Published var mode: String = "online"          // 管线回报的实际模式
-
-    // 菜单可选模型(tag, 显示名)。GPT 走 codex CLI, Claude 用 claude CLI 别名(恒指最新版);
-    // 管线按模型名自动选引擎, 所以清稿和终稿可以混用两家。
-    static let gptModels = [
-        ("gpt-6-luna", "GPT-6 Luna · 快"),
-        ("gpt-6.1-terra", "GPT-6.1 Terra · 均衡"),
-        ("gpt-6.1-sol", "GPT-6.1 Sol · 主力"),
-        ("gpt-6-astra", "GPT-6 Astra · 最强"),
-    ]
-    static let claudeModels = [
-        ("haiku", "Claude Haiku · 快"),
-        ("sonnet", "Claude Sonnet · 均衡"),
-        ("opus", "Claude Opus · 深入"),
-        ("fable", "Claude Fable · 最强"),
-    ]
-    static let defaultDraft = "gpt-6-luna"
-    static let defaultFinal = "gpt-6-astra"
-    private static let allowed = Set((gptModels + claudeModels).map { $0.0 })
+    // 模型选择存在设置文件里, "auto" = 每次按本机可用的模型自动挑
+    @Published private(set) var draftModel = "auto"
+    @Published private(set) var finalModel = "auto"
+    @Published private(set) var detection: Detection?  // 本机可用的 AI(管线 --detect 的结果)
+    @Published private(set) var detecting = false
 
     static let defaultDir = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Recordings/meetings")
@@ -51,9 +36,7 @@ final class RecorderVM: ObservableObject {
 
     init() {
         reloadConfig()
-        // 旧版存下的已下架模型(如 gpt-5.6-*)会让菜单无选中项: 迁到默认值
-        if !Self.allowed.contains(draftModel) { draftModel = Self.defaultDraft }
-        if !Self.allowed.contains(finalModel) { finalModel = Self.defaultFinal }
+        detect()
         timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.poll()
         }
@@ -102,9 +85,52 @@ final class RecorderVM: ObservableObject {
     }
 
     func reloadConfig() {
-        let dir = MeetCapConfig.load()["output_dir"] ?? ""
+        let cfg = MeetCapConfig.load()
+        let dir = cfg["output_dir"] ?? ""
         recDir = dir.isEmpty ? Self.defaultDir : URL(fileURLWithPath: (dir as NSString).expandingTildeInPath)
+        draftModel = cfg["draft_model"] ?? "auto"
+        finalModel = cfg["final_model"] ?? "auto"
     }
+
+    /// 后台跑一次管线的 --detect: 哪些通道已登录 / 填了 key, 各有哪些模型, 自动会挑谁
+    func detect() {
+        guard !scriptMissing, !detecting else { return }
+        detecting = true
+        let cmd = "\(shq(script)) --detect"
+        DispatchQueue.global(qos: .utility).async {
+            let p = Process()
+            let out = Pipe()
+            p.executableURL = URL(fileURLWithPath: "/bin/zsh")
+            p.arguments = ["-lc", cmd]
+            p.standardOutput = out
+            p.standardError = FileHandle.nullDevice
+            var result: Detection?
+            if (try? p.run()) != nil {
+                let data = out.fileHandleForReading.readDataToEndOfFile()
+                p.waitUntilExit()
+                if let line = String(data: data, encoding: .utf8)?.split(separator: "\n").last {
+                    result = try? JSONDecoder().decode(Detection.self, from: Data(line.utf8))
+                }
+            }
+            DispatchQueue.main.async {
+                self.detection = result
+                self.detecting = false
+            }
+        }
+    }
+
+    func modelName(_ id: String) -> String {
+        detection?.models.first { $0.id == id }?.name ?? id
+    }
+
+    /// 菜单里的一行: 「自动 · GPT-6-Luna」或具体模型名
+    func describe(_ choice: String, auto: String?) -> String {
+        guard choice == "auto" else { return modelName(choice) }
+        if let auto { return "自动 · \(modelName(auto))" }
+        return detecting ? "自动 · 检测中…" : "自动"
+    }
+
+    var noAI: Bool { detection.map { $0.models.isEmpty } ?? false }
 
     // ---- 动作 ----
     private func shq(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
@@ -117,11 +143,12 @@ final class RecorderVM: ObservableObject {
     }
 
     func startRecording() {
-        // AppStorage 可被外部 defaults 改写; 只把白名单模型拼进 shell 命令。
-        let draft = Self.allowed.contains(draftModel) ? draftModel : Self.defaultDraft
-        let final = Self.allowed.contains(finalModel) ? finalModel : Self.defaultFinal
-        let flags = (onsite ? " --onsite" : "") + (recordMic ? "" : " --no-mic")
-            + " --model \(draft) --final-model \(final)"
+        // 已检测过就把「自动」的结果直接传下去, 省掉管线开录前再检测的一两秒;
+        // 没检测完则不传, 管线自己读设置并检测
+        let draft = draftModel == "auto" ? detection?.auto.draft : draftModel
+        let final = finalModel == "auto" ? detection?.auto.finalModel : finalModel
+        var flags = (onsite ? " --onsite" : "") + (recordMic ? "" : " --no-mic")
+        if let draft, let final { flags += " --model \(shq(draft)) --final-model \(shq(final))" }
         // taskpolicy -c utility: 整条管线走效率档(效率核+低 GPU 优先级), 压发热;
         // 转写慢两三成但均为后台活, 仅停录后尾块多等十几秒
         shell("nohup taskpolicy -c utility \(shq(script))\(flags) >/dev/null 2>&1 &")
@@ -163,6 +190,19 @@ final class RecorderVM: ObservableObject {
     }
 }
 
+struct Detection: Decodable {
+    struct Model: Decodable, Hashable { let id: String; let name: String; let provider: String }
+    struct Channel: Decodable { let via: String?; let note: String }
+    struct Auto: Decodable {
+        let draft: String?
+        let finalModel: String?
+        enum CodingKeys: String, CodingKey { case draft, finalModel = "final" }
+    }
+    let channels: [String: Channel]
+    let models: [Model]
+    let auto: Auto
+}
+
 // MARK: - 设置(与 meeting_recorder.py 共用一份 JSON)
 
 enum MeetCapConfig {
@@ -195,10 +235,55 @@ struct SettingsView: View {
     @State private var speaker = ""
     @State private var openaiKey = ""
     @State private var anthropicKey = ""
+    @State private var customEnv = ""
+    @State private var draftChoice = "auto"
+    @State private var finalChoice = "auto"
+    @State private var draftTyped = ""
+    @State private var finalTyped = ""
     @State private var status = ""
+
+    private static let typedTag = "__typed__"
+    private static let groups = [("GPT", "codex"), ("Claude", "claude"), ("其他 AI", "custom")]
+    // 常见的 OpenAI 兼容接口: (名称, 接口地址, 申请 API key 的网址)
+    private static let presets = [
+        ("Kimi（月之暗面）", "https://api.moonshot.cn/v1", "https://platform.moonshot.cn"),
+        ("DeepSeek", "https://api.deepseek.com/v1", "https://platform.deepseek.com"),
+        ("Gemini", "https://generativelanguage.googleapis.com/v1beta/openai/", "https://aistudio.google.com/apikey"),
+        ("通义千问（阿里云百炼）", "https://dashscope.aliyuncs.com/compatible-mode/v1", "https://bailian.console.aliyun.com"),
+        ("智谱 GLM", "https://open.bigmodel.cn/api/paas/v4", "https://open.bigmodel.cn"),
+        ("腾讯混元", "https://api.hunyuan.cloud.tencent.com/v1", "https://console.cloud.tencent.com/hunyuan"),
+        ("OpenRouter（一个 key 用多家模型）", "https://openrouter.ai/api/v1", "https://openrouter.ai/keys"),
+    ]
+    // 让用户把这段话发给自己常用的 AI, 由它告诉用户该填什么
+    private static let helpPrompt = """
+        我在用一个叫 MeetCap 的会议纪要工具，它能接任何「OpenAI 兼容」的 AI 接口。\
+        我想用【在这里写你想用的 AI，比如 Kimi / DeepSeek / Gemini / 通义千问 / 智谱】。请告诉我：
+        1. 去哪个网址注册、怎么一步步创建 API key；
+        2. 它的 OpenAI 兼容接口地址（base URL）；
+        3. 适合整理长篇中文会议纪要的模型名：一个速度快的、一个能力最强的。
+        最后严格按下面格式给我一段可以直接粘贴的配置，不要加别的内容：
+        BASE_URL=接口地址
+        API_KEY=（留空，我自己填）
+        MODELS=快的模型名,强的模型名
+        """
 
     var body: some View {
         Form {
+            Section {
+                LabeledContent("本机检测") {
+                    HStack {
+                        Text(detectSummary).foregroundStyle(.secondary).multilineTextAlignment(.trailing)
+                        Button("重新检测") { vm.detect() }.disabled(vm.detecting)
+                    }
+                }
+                modelPicker("清稿 / 提纲", choice: $draftChoice, typed: $draftTyped, auto: vm.detection?.auto.draft)
+                modelPicker("最终纪要", choice: $finalChoice, typed: $finalTyped, auto: vm.detection?.auto.finalModel)
+            } header: {
+                Text("模型")
+            } footer: {
+                Text("不确定就选「自动」：每次开录前检查这台 Mac 能用哪些 AI，清稿挑快的、纪要挑最强的。")
+                    .foregroundStyle(.secondary)
+            }
             Section("纪要与录音") {
                 LabeledContent("保存位置") {
                     Text(outputDir.isEmpty ? RecorderVM.defaultDir.path : outputDir)
@@ -221,6 +306,35 @@ struct SettingsView: View {
                      + "Key 只保存在本机 ~/Library/Application Support/MeetCap/config.json，仅你的账户可读。")
                     .foregroundStyle(.secondary)
             }
+            Section {
+                HStack {
+                    Menu("填入示例") {
+                        ForEach(Self.presets, id: \.0) { name, url, keyURL in
+                            Button(name) {
+                                customEnv = "# \(name)：在 \(keyURL) 创建 API key\nBASE_URL=\(url)\nAPI_KEY=\n"
+                                    + "# MODELS=快的模型名,强的模型名   可不填，不填就列出该接口全部模型\n"
+                            }
+                        }
+                    }
+                    .fixedSize()
+                    Spacer()
+                    Button("复制求助提示") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(Self.helpPrompt, forType: .string)
+                        status = "已复制：粘贴给你常用的 AI，把它给的三行贴到下面"
+                    }
+                }
+                TextEditor(text: $customEnv)
+                    .font(.system(.body, design: .monospaced))
+                    .frame(height: 96)
+            } header: {
+                Text("其他 AI（Kimi、DeepSeek、Gemini、通义千问、智谱…）")
+            } footer: {
+                Text("凡是提供「OpenAI 兼容」接口的服务都能用，填 BASE_URL 和 API_KEY 两行即可。"
+                     + "不知道怎么填：点「复制求助提示」，发给你常用的 AI（Kimi、Gemini、WorkBuddy、豆包都行），"
+                     + "把它回复的三行粘进来，填上 key，保存。")
+                    .foregroundStyle(.secondary)
+            }
             HStack {
                 Text(vm.state == .idle ? status : "录音进行中，结束后再改设置")
                     .foregroundStyle(.secondary)
@@ -229,11 +343,64 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 520)
+        .frame(width: 580, height: 720)
         .disabled(vm.state != .idle)  // 录音中换目录会让菜单找不到当前场次
         .onAppear {
             load()
-            NSApp.activate(ignoringOtherApps: true)  // 菜单栏 app 的窗口默认不在最前
+            vm.detect()
+            Self.bringToFront()
+        }
+    }
+
+    /// 菜单栏 app 的窗口默认可能开在别的窗口后面或另一块屏幕上: 拉到主屏正中、置前
+    static func bringToFront() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            NSApp.activate(ignoringOtherApps: true)
+            for w in NSApp.windows where w.styleMask.contains(.titled) && !(w is NSOpenPanel) {
+                if let f = NSScreen.main?.visibleFrame {
+                    w.setFrameOrigin(NSPoint(x: f.midX - w.frame.width / 2, y: f.midY - w.frame.height / 2))
+                }
+                w.makeKeyAndOrderFront(nil)
+                w.orderFrontRegardless()
+            }
+        }
+    }
+
+    private var detectSummary: String {
+        if vm.detecting { return "检测中…" }
+        guard let d = vm.detection else { return "未检测" }
+        let notes = ["codex", "claude", "custom"].compactMap { d.channels[$0] }
+            .filter { $0.via != nil || $0.note.contains("不可用") }.map(\.note)
+        if d.models.isEmpty {
+            return (notes + ["没有可用的 AI：登录 codex / claude，或填下面的 API key / 其他 AI"])
+                .joined(separator: "；")
+        }
+        return notes.joined(separator: "、") + "，共 \(d.models.count) 个模型"
+    }
+
+    @ViewBuilder
+    private func modelPicker(_ title: String, choice: Binding<String>, typed: Binding<String>,
+                             auto: String?) -> some View {
+        let models = vm.detection?.models ?? []
+        let current = choice.wrappedValue
+        Picker(title, selection: choice) {
+            Text(auto.map { "自动（推荐）· \(vm.modelName($0))" } ?? "自动（推荐）").tag("auto")
+            // 设置里存的模型这次没检测到(比如退出了登录), 仍列出来, 不让选择凭空消失
+            if current != "auto", current != Self.typedTag, !models.contains(where: { $0.id == current }) {
+                Text("\(current)（本次未检测到）").tag(current)
+            }
+            ForEach(Self.groups, id: \.1) { label, provider in
+                let group = models.filter { $0.provider == provider }
+                if !group.isEmpty {
+                    Section(label) {
+                        ForEach(group, id: \.self) { Text($0.name).tag($0.id) }
+                    }
+                }
+            }
+            Text("手动填写模型名…").tag(Self.typedTag)
+        }
+        if current == Self.typedTag {
+            TextField("模型名", text: typed, prompt: Text("如 gpt-6-sol、claude-opus-5、custom:kimi-k2"))
         }
     }
 
@@ -243,7 +410,16 @@ struct SettingsView: View {
         speaker = cfg["speaker"] ?? ""
         openaiKey = cfg["openai_api_key"] ?? ""
         anthropicKey = cfg["anthropic_api_key"] ?? ""
+        customEnv = cfg["custom_env"] ?? ""
+        draftChoice = cfg["draft_model"] ?? "auto"
+        finalChoice = cfg["final_model"] ?? "auto"
         status = ""
+    }
+
+    private func resolved(_ choice: String, _ typed: String) -> String {
+        guard choice == Self.typedTag else { return choice }
+        let name = typed.trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? "auto" : name
     }
 
     private func chooseFolder() {
@@ -259,12 +435,31 @@ struct SettingsView: View {
     private func save() {
         do {
             try MeetCapConfig.save(["output_dir": outputDir, "speaker": speaker,
-                                    "openai_api_key": openaiKey, "anthropic_api_key": anthropicKey])
+                                    "openai_api_key": openaiKey, "anthropic_api_key": anthropicKey,
+                                    "custom_env": customEnv,
+                                    "draft_model": resolved(draftChoice, draftTyped),
+                                    "final_model": resolved(finalChoice, finalTyped)])
             vm.reloadConfig()
+            vm.detect()  // key 或其他 AI 可能变了, 重新看能用哪些模型
+            load()
             status = "已保存，下次开录生效"
         } catch {
             status = "保存失败：\(error.localizedDescription)"
         }
+    }
+}
+
+/// 先激活 app 再开设置窗口; 直接用 SettingsLink 时窗口常被压在别的窗口后面, 看起来像没反应
+struct SettingsButton: View {
+    @Environment(\.openSettings) private var openSettings
+
+    var body: some View {
+        Button("设置…") {
+            NSApp.activate(ignoringOtherApps: true)
+            openSettings()
+            SettingsView.bringToFront()
+        }
+        .keyboardShortcut(",")
     }
 }
 
@@ -273,12 +468,6 @@ struct SettingsView: View {
 @main
 struct MeetCapApp: App {
     @StateObject private var vm = RecorderVM()
-
-    @ViewBuilder private var modelOptions: some View {
-        ForEach(RecorderVM.gptModels, id: \.0) { Text($0.1).tag($0.0) }
-        Divider()
-        ForEach(RecorderVM.claudeModels, id: \.0) { Text($0.1).tag($0.0) }
-    }
 
     var body: some Scene {
         MenuBarExtra {
@@ -293,8 +482,12 @@ struct MeetCapApp: App {
                 Toggle("现场会模式 (用麦克风收全场)", isOn: vm.$onsite)
                 Toggle("同时录我的麦克风", isOn: vm.$recordMic)
                     .disabled(vm.onsite)  // 现场模式强制开麦
-                Picker("清稿 / 提纲模型", selection: vm.$draftModel) { modelOptions }
-                Picker("最终纪要模型", selection: vm.$finalModel) { modelOptions }
+                if vm.noAI {
+                    Text("没检测到可用的 AI：只会生成转录，点「设置…」配置")
+                } else {
+                    Text("清稿：\(vm.describe(vm.draftModel, auto: vm.detection?.auto.draft))")
+                    Text("纪要：\(vm.describe(vm.finalModel, auto: vm.detection?.auto.finalModel))")
+                }
             case .recording:
                 Text(vm.mode == "onsite"
                      ? "现场收音中 \(vm.elapsedText)"
@@ -313,8 +506,7 @@ struct MeetCapApp: App {
             Divider()
             Button("打开最近纪要") { vm.openLatestMinutes() }
             Button("打开录音文件夹") { vm.openFolder() }
-            SettingsLink { Text("设置…") }
-                .keyboardShortcut(",")
+            SettingsButton()
             Divider()
             Button("退出 MeetCap") { NSApplication.shared.terminate(nil) }
                 .keyboardShortcut("q")
