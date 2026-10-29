@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from meeting_recorder import CLEAN_PROMPT, ModelRefusal, Pipeline, call_api, provider_of
+from meeting_recorder import CLEAN_PROMPT, ModelRefusal, Pipeline, call_api, detect_models, parse_custom, provider_of
 
 
 class ModelRunnerTests(unittest.TestCase):
@@ -103,6 +103,44 @@ class ModelRunnerTests(unittest.TestCase):
             msg.stop_reason = "refusal"
             with self.assertRaises(ModelRefusal):
                 call_api("claude", "k", "p", "sonnet", "low", 60)
+
+    def test_auto_picks_fast_draft_and_strong_final_from_what_is_available(self):
+        def cli(provider):
+            return ("/bin/claude", "已登录") if provider == "claude" else (None, "未安装 codex 命令行")
+        with patch("meeting_recorder.cli_status", side_effect=cli):
+            found = detect_models({})
+        self.assertEqual(found["auto"], {"draft": "haiku", "final": "fable"})
+        self.assertIsNone(found["channels"]["codex"]["via"])
+        self.assertEqual({m["provider"] for m in found["models"]}, {"claude"})
+
+    def test_api_key_wins_and_nothing_available_gives_no_auto_model(self):
+        with patch("meeting_recorder.cli_status", return_value=(None, "未安装")), \
+             patch("meeting_recorder.list_models", side_effect=RuntimeError("401")):
+            found = detect_models({"openai_api_key": "bad"})
+        self.assertEqual(found["auto"], {"draft": None, "final": None})
+        self.assertIn("不可用", found["channels"]["codex"]["note"])
+
+    def test_custom_endpoint_from_key_value_text(self):
+        env = parse_custom("# Kimi\nBASE_URL=https://api.moonshot.cn/v1\nAPI_KEY = 'sk-x'\nMODELS=a, b\n")
+        self.assertEqual(env["API_KEY"], "sk-x")
+        self.assertEqual(parse_custom("BASE_URL=https://x\n"), {})  # 缺 key 视为未配置
+        self.assertEqual(provider_of("custom:kimi-k2"), "custom")
+        with patch("meeting_recorder.cli_status", return_value=(None, "未安装")):
+            found = detect_models({"custom_env": "BASE_URL=https://x\nAPI_KEY=k\nMODELS=fast,strong"})
+        self.assertEqual([m["id"] for m in found["models"]], ["custom:fast", "custom:strong"])
+        # 只有自定义接口时也能自动出纪要: 快的清稿, 强的终稿
+        self.assertEqual(found["auto"], {"draft": "custom:fast", "final": "custom:strong"})
+
+    def test_custom_endpoint_uses_chat_completions_without_prefix(self):
+        fake = MagicMock()
+        reply = fake.OpenAI.return_value.chat.completions.create.return_value
+        reply.choices = [SimpleNamespace(message=SimpleNamespace(content="纪要"))]
+        with patch.dict(sys.modules, {"openai": fake}):
+            out = call_api("custom", {"BASE_URL": "https://x/v1", "API_KEY": "k"}, "p", "custom:kimi-k2", "low", 60)
+        self.assertEqual(out, "纪要")
+        self.assertEqual(fake.OpenAI.call_args.kwargs["base_url"], "https://x/v1")
+        create = fake.OpenAI.return_value.chat.completions.create.call_args.kwargs
+        self.assertEqual(create["model"], "kimi-k2")
 
     def test_final_minutes_uses_selected_model_and_preserves_full_transcript_link(self):
         with tempfile.TemporaryDirectory() as tmp:

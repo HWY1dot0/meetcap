@@ -43,7 +43,17 @@ PIDFILE = Path.home() / ".meeting_recorder.pid"
 CONFIG_FILE = Path.home() / "Library" / "Application Support" / "MeetCap" / "config.json"
 # Claude CLI 的模型别名始终指向各档最新版, 不必随发版改名
 CLAUDE_ALIASES = {"haiku", "sonnet", "opus", "fable"}
-DEFAULT_MODELS = {"codex": ("gpt-6-luna", "gpt-6-astra"), "claude": ("sonnet", "fable")}
+CODEX_CACHE = Path.home() / ".codex" / "models_cache.json"  # codex 登录后自动维护的可用模型清单
+CODEX_FALLBACK = [("gpt-6-luna", "GPT-6-Luna"), ("gpt-6.1-terra", "GPT-6.1 Terra"),
+                  ("gpt-6.1-sol", "GPT-6.1-Sol"), ("gpt-6-astra", "GPT-6-Astra")]
+CLAUDE_CLI_MODELS = [("haiku", "Claude Haiku(最新)"), ("sonnet", "Claude Sonnet(最新)"),
+                     ("opus", "Claude Opus(最新)"), ("fable", "Claude Fable(最新)")]
+# 模型选「自动」时的挑选顺序: 清稿/提纲要快, 终稿要强; 都不可用时取检测到的第一个
+AUTO = "auto"
+AUTO_PREFS = {
+    "draft": ["gpt-6-luna", "haiku", "claude-haiku-5-5", "gpt-6.1-terra", "sonnet", "claude-sonnet-5-5"],
+    "final": ["gpt-6-astra", "fable", "claude-fable-5-1", "gpt-6.1-sol", "opus", "claude-opus-5-5"],
+}
 # 直连 API 时别名没有 CLI 帮忙解析, 换成现行模型 ID
 CLAUDE_API_IDS = {"haiku": "claude-haiku-5-5", "sonnet": "claude-sonnet-5-5",
                   "opus": "claude-opus-5-5", "fable": "claude-fable-5-1"}
@@ -61,16 +71,114 @@ def load_config() -> dict:
 
 
 def provider_of(model: str) -> str:
-    """模型名 → 引擎: Claude 别名或 claude-* 走 claude CLI, 其余走 codex。"""
+    """模型名 → 引擎: custom:* 走自定义接口, Claude 别名或 claude-* 走 Claude, 其余走 GPT(codex)。"""
+    if model.startswith("custom:"):
+        return "custom"
     return "claude" if model in CLAUDE_ALIASES or model.startswith("claude-") else "codex"
+
+
+def parse_custom(text: str | None) -> dict:
+    """设置里「其他 AI」的 KEY=VALUE 文本 → {BASE_URL, API_KEY, MODELS}; 缺地址或 key 时返回空。"""
+    env = {}
+    for line in (text or "").splitlines():
+        key, sep, value = line.strip().partition("=")
+        if sep and not key.startswith("#"):
+            env[key.strip().upper()] = value.strip().strip('"\'')
+    return env if env.get("BASE_URL") and env.get("API_KEY") else {}
+
+
+def cli_status(provider: str) -> tuple[str | None, str]:
+    """(已登录 CLI 路径或 None, 给人看的说明)"""
+    name = "Codex" if provider == "codex" else "Claude"
+    cli = shutil.which(provider)
+    if not cli:
+        return None, f"未安装 {provider} 命令行"
+    status = [cli, "login", "status"] if provider == "codex" else [cli, "auth", "status"]
+    try:
+        ok = subprocess.run(status, capture_output=True, text=True, timeout=15).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        ok = False
+    return (cli, f"{name} 命令行已登录") if ok else (None, f"{provider} 命令行未登录")
+
+
+def list_models(provider: str, via: str, key: str | None) -> list[tuple[str, str]]:
+    """某通道实际可用的模型 [(模型名, 显示名)], 新的/推荐的在前。"""
+    if via == "cli" and provider == "codex":
+        try:
+            cached = json.loads(CODEX_CACHE.read_text())["models"]
+        except (OSError, json.JSONDecodeError, KeyError, TypeError):
+            return CODEX_FALLBACK
+        shown = sorted((m for m in cached if m.get("visibility") == "list"),
+                       key=lambda m: m.get("priority", 99))
+        return [(m["slug"], m.get("display_name") or m["slug"]) for m in shown] or CODEX_FALLBACK
+    if via == "cli":
+        return CLAUDE_CLI_MODELS
+    if provider == "custom":
+        names = [m.strip() for m in key.get("MODELS", "").split(",") if m.strip()]
+        if not names:  # 没写 MODELS 就问接口要清单
+            from openai import OpenAI
+            client = OpenAI(base_url=key["BASE_URL"], api_key=key["API_KEY"], timeout=15)
+            names = [m.id for m in client.models.list()][:20]
+        return [(f"custom:{n}", n) for n in names]
+    if provider == "codex":
+        from openai import OpenAI
+        # 只留可做文本推理的 GPT 主型号: 去掉日期快照与语音/图像等专用型号
+        found = [m for m in OpenAI(api_key=key, timeout=15).models.list()
+                 if re.match(r"gpt-[5-9]", m.id)
+                 and not re.search(r"\d{4}-\d{2}-\d{2}|audio|realtime|tts|transcribe|image|search", m.id)]
+        found.sort(key=lambda m: m.created, reverse=True)
+        return [(m.id, m.id) for m in found[:10]]
+    import anthropic
+    found = sorted(anthropic.Anthropic(api_key=key, timeout=15).models.list(),
+                   key=lambda m: m.created_at, reverse=True)
+    return [(m.id, m.display_name) for m in found[:10]]
+
+
+def detect_models(cfg: dict) -> dict:
+    """检测本机能用哪些 AI: 每家填了 API key 走 API, 否则看 CLI 是否已登录; 并给出自动挑选结果。"""
+    keys = {"codex": cfg.get("openai_api_key"), "claude": cfg.get("anthropic_api_key"),
+            "custom": parse_custom(cfg.get("custom_env"))}
+    channels, models = {}, []
+    for provider in ("codex", "claude", "custom"):
+        if provider == "custom":
+            via = "api" if keys["custom"] else None
+            note = "其他 AI 接口" if via else "未配置其他 AI"
+        elif keys[provider]:
+            via, note = "api", ("OpenAI" if provider == "codex" else "Anthropic") + " API key"
+        else:
+            cli, note = cli_status(provider)
+            via = "cli" if cli else None
+        found = []
+        if via:
+            try:
+                found = list_models(provider, via, keys[provider])
+            except Exception as exc:
+                via, note = None, f"{note}不可用({type(exc).__name__})"
+        channels[provider] = {"via": via, "note": note}
+        models += [{"id": i, "name": n, "provider": provider} for i, n in found]
+    ids = [m["id"] for m in models]
+    # 偏好清单里都没有(例如只配了其他 AI): 取第一家的第一个做清稿、最后一个做终稿,
+    # 所以 MODELS 按「快的,强的」顺序写
+    first = [m["id"] for m in models if m["provider"] == models[0]["provider"]] if models else [None]
+    fallback = {"draft": first[0], "final": first[-1]}
+    auto = {stage: next((m for m in prefs if m in ids), fallback[stage])
+            for stage, prefs in AUTO_PREFS.items()}
+    return {"channels": channels, "models": models, "auto": auto}
 
 
 class ModelRefusal(Exception):
     """模型(含服务端回退)拒绝处理这段内容。"""
 
 
-def call_api(provider: str, key: str, prompt: str, model: str, effort: str, timeout: int) -> str:
-    """用用户自己的 API key 直连 OpenAI / Anthropic; 失败抛异常, 由调用方记日志降级。"""
+def call_api(provider: str, key, prompt: str, model: str, effort: str, timeout: int) -> str:
+    """用用户自己的 API key 直连 OpenAI / Anthropic / OpenAI 兼容接口; 失败抛异常, 由调用方记日志降级。"""
+    if provider == "custom":
+        # 各家兼容接口普遍只支持 Chat Completions, 也不认推理强度参数
+        from openai import OpenAI
+        client = OpenAI(base_url=key["BASE_URL"], api_key=key["API_KEY"], timeout=timeout)
+        resp = client.chat.completions.create(model=model.removeprefix("custom:"),
+                                              messages=[{"role": "user", "content": prompt}])
+        return resp.choices[0].message.content or ""
     if provider == "codex":
         from openai import OpenAI
         client = OpenAI(api_key=key, timeout=timeout)
@@ -79,8 +187,9 @@ def call_api(provider: str, key: str, prompt: str, model: str, effort: str, time
     import anthropic
     client = anthropic.Anthropic(api_key=key, timeout=timeout)
     model_id = CLAUDE_API_IDS.get(model, model)
-    request = dict(model=model_id, max_tokens=64000, output_config={"effort": effort},
-                   messages=[{"role": "user", "content": prompt}])
+    request = dict(model=model_id, max_tokens=64000, messages=[{"role": "user", "content": prompt}])
+    if not re.search(r"haiku-4|claude-3", model_id):  # 这些旧型号不接受 effort
+        request["output_config"] = {"effort": effort}
     # 终稿输入可达整场转录, 用流式避免长请求超时
     if model_id in CLAUDE_FALLBACK_IDS:
         stream = client.beta.messages.stream(**request, betas=["server-side-fallback-2026-07-01"],
@@ -704,11 +813,9 @@ def main():
     ap.add_argument("--no-mic", action="store_true", help="不录麦克风轨")
     ap.add_argument("--onsite", action="store_true",
                     help="现场会模式: 麦克风为主轨(标签「现场」), 强制开麦, 告警盯麦克风")
-    ap.add_argument("--provider", choices=("codex", "claude"), default="codex",
-                    help="未指定模型时用哪家的默认模型(默认 codex); 指定模型时按模型名自动选引擎")
-    ap.add_argument("--model", help="清稿与滚动提纲模型(默认 Codex: gpt-6-luna; Claude: sonnet)")
-    ap.add_argument("--final-model",
-                    help="最终纪要模型(默认 Codex: gpt-6-astra; Claude: fable; 单独指定 --model 时继承)")
+    ap.add_argument("--model", help="清稿与滚动提纲模型(默认取设置; 未设置或 auto 时自动挑选)")
+    ap.add_argument("--final-model", help="最终纪要模型(默认取设置或自动挑选; 单独指定 --model 时继承)")
+    ap.add_argument("--detect", action="store_true", help="检测本机可用的模型, 输出 JSON 后退出")
     ap.add_argument("--no-clean", action="store_true", help="跳过所有 AI 清稿与纪要生成")
     ap.add_argument("--out-dir", help=f"纪要与录音的保存目录(默认取设置, 否则 {DEFAULT_DIR})")
     args = ap.parse_args()
@@ -716,34 +823,40 @@ def main():
     out_dir = args.out_dir or cfg.get("output_dir")
     args.out_dir = Path(out_dir).expanduser() if out_dir else DEFAULT_DIR
     args.speaker = cfg.get("speaker") or "本人"
-    args.api_keys = {"codex": cfg.get("openai_api_key"), "claude": cfg.get("anthropic_api_key")}
-    chosen_model = args.model
-    draft_default, final_default = DEFAULT_MODELS[args.provider]
-    args.model = chosen_model or draft_default
-    args.final_model = args.final_model or chosen_model or final_default
+    args.api_keys = {"codex": cfg.get("openai_api_key"), "claude": cfg.get("anthropic_api_key"),
+                     "custom": parse_custom(cfg.get("custom_env"))}
+    if args.detect:
+        print(json.dumps(detect_models(cfg), ensure_ascii=False))
+        return
+    draft = args.model or cfg.get("draft_model") or AUTO
+    final = args.final_model or args.model or cfg.get("final_model") or AUTO
+    if not args.no_clean and not args.stop and AUTO in (draft, final):
+        auto = detect_models(cfg)["auto"]
+        draft = auto["draft"] if draft == AUTO else draft
+        final = auto["final"] if final == AUTO else final
+    args.model, args.final_model = draft, final
     if args.onsite:
         args.no_mic = False  # 现场会唯一的声音入口就是麦克风
 
     if args.stop:
         sys.exit(do_stop())
     if not args.no_clean:
-        for provider in sorted({provider_of(args.model), provider_of(args.final_model)}):
+        # AI 不可用时照常录音和转写, 只是不出 AI 纪要——录音本身绝不因此失败
+        problem = None if args.model and args.final_model else "没检测到可用的 AI 模型"
+        for provider in sorted({provider_of(m) for m in (args.model, args.final_model) if m}):
             if args.api_keys.get(provider):
-                continue  # 走 API key, 不需要 CLI 登录
-            cli = shutil.which(provider)
-            if not cli:
-                print(f"找不到 {provider} CLI。请先安装并登录, 或在 MeetCap 设置里填 API key, "
-                      "或用 --no-clean 只做本地转录。")
-                sys.exit(1)
-            status = [cli, "login", "status"] if provider == "codex" else [cli, "auth", "status"]
-            try:
-                login = subprocess.run(status, capture_output=True, text=True, timeout=15)
-            except (OSError, subprocess.TimeoutExpired):
-                login = None
-            if login is None or login.returncode != 0:
-                hint = "codex login" if provider == "codex" else "claude auth login"
-                print(f"{provider} 尚未登录。请先运行 {hint}, 或用 --no-clean 只做本地转录。")
-                sys.exit(1)
+                continue
+            if provider == "custom":
+                problem = "未配置其他 AI 接口"
+            else:
+                cli, note = cli_status(provider)
+                if not cli:
+                    problem = note
+        if problem:
+            msg = f"{problem}, 本场只生成转录。打开 MeetCap 设置配置 AI 后即可出纪要。"
+            print(msg)
+            notify("会议录音", msg)
+            args.no_clean = True
     if PIDFILE.exists():
         try:  # 信号 0 探活
             os.kill(int(PIDFILE.read_text().strip()), 0)
