@@ -142,6 +142,18 @@ class ModelRunnerTests(unittest.TestCase):
         create = fake.OpenAI.return_value.chat.completions.create.call_args.kwargs
         self.assertEqual(create["model"], "kimi-k2")
 
+    def test_long_lists_default_to_recommended_and_user_ticks_win(self):
+        many = [("gpt-6.1-sol", "GPT-6.1 Sol"), ("gpt-6-astra", "GPT-6 Astra"), ("gpt-6-luna", "GPT-6 Luna"),
+                ("gpt-5.6-luna", "GPT-5.6 Luna"), ("gpt-6.1-terra", "GPT-6.1 Terra")]
+        with patch("meeting_recorder.cli_status", side_effect=lambda p: ("/bin/x", "ok") if p == "codex" else (None, "无")), \
+             patch("meeting_recorder.list_models", return_value=many):
+            found = detect_models({})
+            on = [m["id"] for m in found["models"] if m["enabled"]]
+            self.assertEqual(on, ["gpt-6-luna", "gpt-6.1-terra", "gpt-6.1-sol", "gpt-6-astra"])  # 快→强, 旧版不进下拉
+            mine = detect_models({"enabled_models": "gpt-5.6-luna,gpt-6.1-sol"})
+        self.assertEqual([m["id"] for m in mine["models"] if m["enabled"]], ["gpt-6.1-sol", "gpt-5.6-luna"])
+        self.assertEqual(mine["auto"]["final"], "gpt-6.1-sol")  # 自动只在勾选的模型里挑
+
     def test_final_minutes_uses_selected_model_and_preserves_full_transcript_link(self):
         with tempfile.TemporaryDirectory() as tmp:
             pipeline = self.pipeline(Path(tmp))
