@@ -1,0 +1,6 @@
+# 编译产物, 由 build_app.sh 生成
+audiotap
+MeetCap
+__pycache__/
+*.py[cod]
+.DS_Store
