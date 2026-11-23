@@ -8,7 +8,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from meeting_recorder import CLEAN_PROMPT, ModelRefusal, Pipeline, call_api, detect_models, parse_custom, provider_of
+from meeting_recorder import (CLEAN_PROMPT, ModelRefusal, Pipeline, call_api, detect_models, label_speakers,
+                              match_voice, parse_custom, provider_of, review_paragraphs, split_sentences,
+                              timeline_rows)
 
 
 class ModelRunnerTests(unittest.TestCase):
@@ -175,6 +177,107 @@ class ModelRunnerTests(unittest.TestCase):
                 pipeline.finalize_minutes("这是完整转录。")
             self.assertIn("纪要未生成", pipeline.minutes_md.read_text())
             self.assertIn("未完成", notify.call_args.args[1])
+
+    def test_review_page_follows_cleaned_turns_and_maps_sentences_to_audio(self):
+        segs = [
+            {"t": 0.0, "end": 9.0, "track": "sys", "speaker": "对方", "lp": -0.2,
+             "text": "嗯大家好今天我们主要聊一下明年的利率路径然后呢市场现在定价是两次降息"},
+            {"t": 9.2, "end": 18.0, "track": "sys", "speaker": "对方", "lp": -1.3,
+             "text": "但是我们觉得这个定价偏多了因为核心PCB还在百分之二点八"},
+            {"t": 19.0, "end": 24.0, "track": "mic", "speaker": "本人", "lp": -0.1, "text": "那你们的基准情形是几次"},
+            {"t": 25.0, "end": 36.0, "track": "sys", "speaker": "对方", "lp": -0.2,
+             "text": "基准是一次放在下半年如果就业明显走弱才会提前"},
+        ]
+        blocks = [
+            (0, "对方", "大家好，今天主要聊一下明年的利率路径。市场现在定价是两次降息，但我们觉得这个定价偏多了，"
+                      "因为核心PCE还在2.8%。\n\n基准是一次，放在下半年。如果就业明显走弱，才会提前。"),
+            (0, "本人", "那你们的基准情形是几次？"),
+        ]
+        paras = review_paragraphs(segs, blocks, 150)
+        self.assertEqual([p["speaker"] for p in paras], ["对方", "本人", "对方"])   # 两条音轨按时间交错成对话
+        self.assertEqual([p["track"] for p in paras], ["sys", "mic", "sys"])
+        first, _, last = paras
+        self.assertEqual(first["sents"][0]["text"], "大家好，今天主要聊一下明年的利率路径。")  # 显示的是清稿后的句子
+        self.assertLess(first["sents"][0]["t"], 2)
+        self.assertTrue(4 < first["sents"][1]["t"] < 9)          # 第二句落在原始转写的对应位置
+        self.assertEqual([s["low"] for s in first["sents"]], [False, True])   # 低置信标记跟着原始句走
+        self.assertEqual([s["t"] for s in last["sents"]][0], 25.0)
+        self.assertGreater(last["sents"][1]["t"], 28)
+
+    def test_review_page_falls_back_to_raw_sentences_for_uncleaned_block(self):
+        segs = [{"t": 150.0 + 10 * i, "end": 158.0 + 10 * i, "track": "sys", "speaker": "对方", "lp": -0.1,
+                 "text": "this part was never cleaned so it has no punctuation at all " * 3} for i in range(4)]
+        segs[3]["t"], segs[3]["end"] = 195.0, 199.0             # 前一句结束后停顿超过 2 秒
+        blocks = [(150, "对方", " ".join(s["text"].strip() for s in segs))]
+        paras = review_paragraphs(segs, blocks, 150)
+        self.assertEqual([s["t"] for p in paras for s in p["sents"]], [150.0, 160.0, 170.0, 195.0])
+        self.assertEqual(len(paras), 2)                          # 停顿处另起一段
+
+    def test_split_sentences_merges_short_fragments(self):
+        self.assertEqual(split_sentences("Totally. Because we were in Hong Kong. It was 6.1 percent."),
+                         ["Totally. Because we were in Hong Kong.", "It was 6.1 percent."])
+        self.assertEqual(split_sentences("好。我们今天聊利率路径。然后看久期？"), ["好。我们今天聊利率路径。", "然后看久期？"])
+
+    def test_review_page_splits_turns_by_voice_not_by_cleaners_guess(self):
+        # 清稿把一个人的三句话猜成了三轮; 声音说前两句是 0 号、最后一句是 1 号
+        words = [[0.0, "我们"], [0.4, "看"], [0.8, "自主可控"], [2.0, "听着"], [2.4, "像"], [2.8, "口号"],
+                 [5.0, "我"], [5.3, "不"], [5.6, "知道"], [5.9, "它"], [6.2, "叫"], [6.5, "这个"]]
+        segs = [{"t": 0.0, "end": 7.0, "track": "sys", "speaker": "对方", "lp": -0.1,
+                 "text": "我们看自主可控听着像口号我不知道它叫这个", "w": words}]
+        blocks = [(0, "对方", "我们看自主可控。\n\n听着像口号。\n\n我不知道它叫这个。")]
+        voices = [{"t": 0.0, "end": 4.2, "track": "sys", "spk": 0}, {"t": 4.8, "end": 7.0, "track": "sys", "spk": 1}]
+        paras = review_paragraphs(segs, blocks, 150, voices)
+        self.assertEqual([[s["text"] for s in p["sents"]] for p in paras],
+                         [["我们看自主可控。", "听着像口号。"], ["我不知道它叫这个。"]])
+        self.assertEqual([s["t"] for p in paras for s in p["sents"]], [0.0, 2.0, 5.0])   # 词级时间直接定位句首
+        self.assertEqual(label_speakers(paras), ["A", "B"])
+        self.assertEqual([p["speaker"] for p in paras], ["发言人 A", "发言人 B"])
+        label_speakers(paras, {"B": "Tracy"})                                          # 认出名字的换成名字
+        self.assertEqual([p["speaker"] for p in paras], ["发言人 A", "Tracy"])
+        solo = review_paragraphs(segs, blocks, 150, voices[:1])
+        self.assertEqual(label_speakers(solo), [])                                     # 只听出一个人: 不起代称
+        self.assertEqual({p["speaker"] for p in solo}, {"对方"})
+
+    def test_match_voice_merges_same_speaker_and_ignores_unstable_snippets(self):
+        voices = []
+        self.assertEqual(match_voice(voices, [1.0, 0.0], 30), 0)       # 第一个人
+        self.assertEqual(match_voice(voices, [0.0, 1.0], 20), 1)       # 不像 → 新人
+        self.assertEqual(match_voice(voices, [0.96, 0.28], 10), 0)     # 像 0 号 → 并入
+        self.assertEqual(voices[0]["dur"], 40)
+        self.assertIsNone(match_voice(voices, [-0.6, -0.8], 1.2))      # 只说了一秒又谁都不像: 不归人
+        self.assertEqual(match_voice(voices, [0.45, 0.89], 1.2), 1)    # 一秒的片段也够像 1 号 → 归 1 号
+        self.assertEqual(len(voices), 2)
+
+    def test_timeline_rows_keep_word_times_in_session_clock(self):
+        rows = timeline_rows([{"start": 1.0, "end": 3.0, "text": " 你好 世界", "avg_logprob": -0.25,
+                               "words": [{"start": 1.0, "end": 1.5, "word": " 你好"}, {"start": 2.0, "end": 3.0, "word": " 世界"}]},
+                              {"start": 3.0, "end": 4.0, "text": "  "}], 150, "sys", "对方")
+        self.assertEqual(rows, [{"t": 151.0, "end": 153.0, "track": "sys", "speaker": "对方", "text": "你好 世界",
+                                 "lp": -0.25, "w": [[151.0, "你好"], [152.0, "世界"]]}])
+
+    def test_name_speakers_accepts_only_a_clean_mapping(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline = self.pipeline(Path(tmp))
+            paras = [{"speaker": "发言人 A", "track": "sys", "spk": 0, "sents": [{"t": 0, "text": "I'm Joe.", "low": False}]}]
+            with patch.object(pipeline, "run_llm",
+                              return_value='<out>{"A": " Joe ", "B": "", "C": 3, "发言人 D": "Tracy"}</out>') as run:
+                self.assertEqual(pipeline.name_speakers(paras), {"A": "Joe", "D": "Tracy"})
+            self.assertIn("发言人 A: I'm Joe.", run.call_args.args[1])
+            with patch.object(pipeline, "run_llm", return_value="我猜是 Joe"):
+                self.assertEqual(pipeline.name_speakers(paras), {})                    # 不守格式的输出一律不用
+
+    def test_sentence_goes_to_whoever_spoke_most_words_not_longest_time(self):
+        # 片头旁白只说了两个词却占 5 秒(后面是音乐), 主持人随后 2 秒里说了六个词, 没清稿所以连成一句
+        words = [[0.0, "彭博"], [0.6, "播客"]] + [[15.0 + 0.3 * i, w] for i, w in enumerate(["大家", "好", "欢迎", "收听", "本期", "节目"])]
+        segs = [{"t": 0.0, "end": 17.0, "track": "sys", "speaker": "对方", "lp": -0.1,
+                 "text": "彭博播客大家好欢迎收听本期节目。", "w": words},
+                {"t": 17.5, "end": 20.0, "track": "sys", "speaker": "对方", "lp": -0.1,
+                 "text": "我是另一位主持人。", "w": [[17.5, "我"], [17.8, "是"], [18.1, "另一位"], [18.6, "主持人"]]}]
+        blocks = [(0, "对方", "彭博播客大家好欢迎收听本期节目。我是另一位主持人。")]
+        voices = [{"t": 0.0, "end": 5.0, "track": "sys", "spk": 0}, {"t": 14.8, "end": 17.0, "track": "sys", "spk": 1},
+                  {"t": 17.4, "end": 20.0, "track": "sys", "spk": 2}]
+        paras = review_paragraphs(segs, blocks, 150, voices)
+        self.assertEqual([p["spk"] for p in paras], [1, 2])
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["mlx-whisper", "anthropic", "openai"]
+# dependencies = ["mlx-whisper", "anthropic", "openai", "sherpa-onnx"]
 # ///
 """
 会议录音 + 流式转写管线 v2 (Core Audio tap 版)
@@ -16,7 +16,10 @@
 """
 
 import argparse
+import bisect
 import datetime
+import difflib
+import hashlib
 import json
 import os
 import queue
@@ -25,9 +28,12 @@ import shutil
 import signal
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
+import urllib.request
+import wave
 from pathlib import Path
 
 TOOL_DIR = Path(__file__).resolve().parent
@@ -41,6 +47,19 @@ DEFAULT_DIR = Path.home() / "Recordings" / "meetings"
 PIDFILE = Path.home() / ".meeting_recorder.pid"
 # MeetCap「设置…」写入; 命令行运行也读同一份
 CONFIG_FILE = Path.home() / "Library" / "Application Support" / "MeetCap" / "config.json"
+# 按声音分辨说话人用的两个模型: 首次用到时下载到本机(约 34MB), 校验后离线运行
+MODELS_DIR = CONFIG_FILE.parent / "models"
+_SHERPA = "https://github.com/k2-fsa/sherpa-onnx/releases/download"
+SPEAKER_MODELS = {  # 本地文件名: (下载地址, 压缩包内路径或 None, sha256)
+    "pyannote-segmentation-3-0.onnx": (
+        f"{_SHERPA}/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2",
+        "sherpa-onnx-pyannote-segmentation-3-0/model.onnx",
+        "220ad67ca923bef2fa91f2390c786097bf305bceb5e261d4af67b38e938e1079"),
+    "3dspeaker-campplus-zh-en.onnx": (
+        f"{_SHERPA}/speaker-recongition-models/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx",
+        None,
+        "53cab20ba8f2eb2f6e2d89ecc18e88ef3222169b61b4419cbc13666744a4574b"),
+}
 # Claude CLI 的模型别名始终指向各档最新版, 不必随发版改名
 CLAUDE_ALIASES = {"haiku", "sonnet", "opus", "fable"}
 CODEX_CACHE = Path.home() / ".codex" / "models_cache.json"  # codex 登录后自动维护的可用模型清单
@@ -274,70 +293,398 @@ CLEAN_PROMPT = (
 )
 
 
+NAME_PROMPT = (
+    "下面是一段已经按声音分好说话人的会议转录, 说话人暂用「发言人 A」「发言人 B」这样的代称。"
+    "请只根据转录内容判断每个代称对应的真实姓名: 依据可以是本人的自我介绍、别人对他的称呼、主持人的介绍。"
+    "注意「A 喊了某个名字」说明被喊的是别人, 不是 A 自己。没有明确依据的代称不要猜, 直接不写。"
+    "输出规则(严格遵守): 在 <out> 与 </out> 之间输出一个 JSON 对象, 键是代称字母(如 \"A\"), "
+    "值是姓名(沿用转录里的写法, 不加头衔和解释); 一个都确定不了就输出 <out>{}</out>。标签外不写任何内容。"
+)
+
+
 REVIEW_TEMPLATE = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>TITLE</title>
 <style>
- body{font:15px/2.0 -apple-system,"PingFang SC",sans-serif;max-width:780px;margin:0 auto;
+ body{font:16px/1.85 -apple-system,"PingFang SC",sans-serif;max-width:700px;margin:0 auto;
       padding:0 20px 80px;background:#fafafa;color:#222;}
  header{position:sticky;top:0;background:#fafafa;padding:10px 0 8px;border-bottom:1px solid #ddd;z-index:9;}
  .hint{font-size:12px;color:#888;margin-bottom:4px;}
  .tn{font-size:11px;color:#999;margin-top:4px;}
  audio{width:100%;height:32px;}
- .who{font-weight:600;margin:16px 0 2px;color:#b33;font-size:13px;}
- .seg{cursor:pointer;border-radius:3px;padding:1px 2px;}
- .seg:hover{background:#00000014;}
+ main{padding-top:10px;}
+ p{margin:0 0 16px;}
+ p.me{border-left:3px solid #c0392b66;padding-left:12px;}
+ .who{font-weight:600;margin:22px 0 4px;color:#b33;font-size:13px;}
+ .who.c1{color:#1f6fb2;}.who.c2{color:#2e8b57;}.who.c3{color:#8e44ad;}.who.c4{color:#b9770e;}.who.c5{color:#008b8b;}
+ .seg{cursor:pointer;border-radius:3px;padding:2px 0;-webkit-box-decoration-break:clone;box-decoration-break:clone;}
+ .seg:hover{background:#00000012;}
  .seg.low{background:#ffd70040;}
- .seg.now{background:#ff572245;}
- .tt{color:#aaa;font-size:11px;margin:0 3px 0 1px;}
+ .seg.now{background:#ff572238;}
  @media(prefers-color-scheme:dark){
   body,header{background:#1d1d1f;color:#ddd;}
   header{border-color:#333;}.seg:hover{background:#ffffff1a;}
-  .seg.low{background:#8a6d0060;}.who{color:#e88;}}
+  .seg.low{background:#8a6d0060;}.who{color:#e88;}
+  .who.c1{color:#6ab0f3;}.who.c2{color:#6fcf97;}.who.c3{color:#c39bd3;}.who.c4{color:#f0b35a;}.who.c5{color:#5fd0d0;}}
 </style></head><body>
 <header>
- <div class="hint">点任意句子从该处播放 · <span style="background:#ffd70040;padding:0 4px;border-radius:3px;">黄底</span> = 转写置信度低, 重点核对</div>
+ <div class="hint">点任意一句, 从那里开始播放 · 空格键暂停 / 继续 · <span style="background:#ffd70040;padding:0 4px;border-radius:3px;">黄底</span> = 转写置信度低, 重点核对</div>
  AUDIOTAGS
 </header>
 <main id="m"></main>
 <script>
-const SEGS = SEGDATA;
+const PARAS = PARADATA;
 const audios = {};
 document.querySelectorAll("audio").forEach(a => audios[a.dataset.track] = a);
 const m = document.getElementById("m");
-let lastWho = null, p = null;
-SEGS.forEach((s, i) => {
-  if (s.speaker !== lastWho) {
-    const w = document.createElement("div"); w.className = "who"; w.textContent = s.speaker;
-    m.appendChild(w); p = document.createElement("p"); m.appendChild(p); lastWho = s.speaker;
+const whos = [...new Set(PARAS.map(p => p.speaker))];  // 出场顺序, 每人一个颜色
+const showWho = whos.length > 1;
+const byTrack = {};  // 每条音轨的句子按时间排, 供播放时定位当前句
+let lastWho = null, last = Object.values(audios)[0], nowEl = null;
+PARAS.forEach(para => {
+  if (showWho && para.speaker !== lastWho) {
+    const w = document.createElement("div"); w.textContent = para.speaker;
+    w.className = "who c" + whos.indexOf(para.speaker) % 6;
+    m.appendChild(w);
   }
-  const sp = document.createElement("span");
-  sp.className = "seg" + (s.lp < -1.0 ? " low" : ""); sp.id = "s" + i;
-  sp.innerHTML = '<span class="tt">' + fmt(s.t) + '</span>' + esc(s.text) + ' ';
-  sp.onclick = () => {
-    for (const k in audios) if (k !== s.track) audios[k].pause();
-    const a = audios[s.track]; a.currentTime = Math.max(0, s.t - 0.8); a.play();
-  };
-  p.appendChild(sp);
+  lastWho = para.speaker;
+  const p = document.createElement("p");
+  if (showWho && para.track === "mic") p.className = "me";
+  para.sents.forEach(s => {
+    const sp = document.createElement("span");
+    sp.className = "seg" + (s.low ? " low" : "");
+    sp.textContent = s.text;
+    sp.onclick = () => {
+      if (String(window.getSelection())) return;  // 在选字, 不抢播放
+      const a = audios[para.track]; if (!a) return;
+      for (const k in audios) if (k !== para.track) audios[k].pause();
+      a.currentTime = Math.max(0, s.t - 1); a.play(); last = a;
+    };
+    p.appendChild(sp);
+    if (!/[\\u3000-\\u303f\\u4e00-\\u9fff\\uff00-\\uffef]$/.test(s.text)) p.appendChild(document.createTextNode(" "));
+    (byTrack[para.track] = byTrack[para.track] || []).push({t: s.t, el: sp});
+  });
+  m.appendChild(p);
 });
-function fmt(t){t=Math.floor(t);return Math.floor(t/60)+":"+String(t%60).padStart(2,"0");}
-function esc(x){const d=document.createElement("div");d.textContent=x;return d.innerHTML;}
+for (const k in byTrack) byTrack[k].sort((a, b) => a.t - b.t);
+const header = document.querySelector("header");
+function inView(el) {
+  const r = el.getBoundingClientRect();
+  return r.bottom > header.offsetHeight && r.top < window.innerHeight;
+}
 setInterval(() => {
   for (const k in audios) {
     const a = audios[k]; if (a.paused) continue;
-    const t = a.currentTime;
-    document.querySelectorAll(".seg.now").forEach(e => e.classList.remove("now"));
-    for (let i = SEGS.length - 1; i >= 0; i--) {
-      const s = SEGS[i];
-      if (s.track === k && s.t <= t && t <= s.end + 1) {
-        document.getElementById("s" + i)?.classList.add("now"); break;
-      }
-    }
+    const list = byTrack[k] || []; let el = null;
+    for (let i = list.length - 1; i >= 0; i--) if (list[i].t - 1 <= a.currentTime) { el = list[i].el; break; }
+    if (el === nowEl) return;
+    const follow = !nowEl || inView(nowEl);  // 读者翻到别处时不把页面拽回来
+    if (nowEl) nowEl.classList.remove("now");
+    if (el) { el.classList.add("now"); if (follow && !inView(el)) el.scrollIntoView({block: "center", behavior: "smooth"}); }
+    nowEl = el; return;
   }
-}, 500);
+}, 250);
+document.addEventListener("keydown", e => {
+  if (e.code !== "Space" || !last || e.target.tagName === "AUDIO") return;
+  e.preventDefault(); last.paused ? last.play() : last.pause();
+});
 </script></body></html>
 """
 
+
+_TOKEN = re.compile(r"[A-Za-z0-9']+|[㐀-鿿]")
+_SENT_END = "。！？!?…"
+
+
+def _wlen(text: str) -> int:
+    """排版长度: 中日韩字符算 2, 其余算 1"""
+    return sum(2 if ord(c) > 0x2E80 else 1 for c in text)
+
+
+def split_sentences(text: str) -> list[str]:
+    """按句末标点切成审计页的点击单元; 过短的片段(称呼、缩写)并入下一句"""
+    out, start, i, n = [], 0, 0, len(text)
+    while i < n:
+        c = text[i]
+        if c in _SENT_END or (c == "." and (i + 1 == n or text[i + 1].isspace())):
+            i += 1
+            while i < n and text[i] in _SENT_END + "”’」』）)\"'":
+                i += 1
+            if _wlen(text[start:i].strip()) >= 12:
+                out.append(text[start:i].strip())
+                start = i
+        else:
+            i += 1
+    if text[start:].strip():
+        out.append(text[start:].strip())
+    return out
+
+
+def timeline_rows(segments, base: int, track: str, label: str) -> list[dict]:
+    """whisper 分句 → 时间轴行(全场时间); 带词级时间戳时一并存下, 供审计页把每句对回录音"""
+    rows = []
+    for s in segments or []:
+        if not s["text"].strip():
+            continue
+        row = {"t": round(float(base + s["start"]), 1), "end": round(float(base + s["end"]), 1),
+               "track": track, "speaker": label, "text": s["text"].strip(),
+               "lp": round(float(s.get("avg_logprob", 0)), 2)}
+        words = [[round(float(base + w["start"]), 2), w["word"].strip()]
+                 for w in s.get("words") or [] if w.get("word", "").strip()]
+        if words:
+            row["w"] = words
+        rows.append(row)
+    return rows
+
+
+def review_paragraphs(segs: list[dict], blocks: list[tuple], chunk: int,
+                      voices: list[dict] | None = None) -> list[dict]:
+    """转录正文块 × 句级时间轴 → 审计页段落 [{speaker, track, spk, sents: [{t, text, low}]}]。
+    正文是清稿后的, 字句已被改过, 所以用词序列对齐把每句映射回原始转写的时间;
+    没清过稿的块(无标点)直接按原始转写句排, 按停顿与长度分段。
+    voices 是按声音分出的 [{t, end, track, spk}]: 有它就按「谁在说」分段(换人另起一段),
+    没有则沿用清稿分好的轮次。"""
+    track_of = {s["speaker"]: s["track"] for s in segs}
+    paras = []
+    for sec, label, text in blocks:
+        track = track_of.get(label, "sys" if label == "对方" else "mic")
+        own = sorted((s for s in segs if s["track"] == track and sec <= s["t"] < sec + chunk),
+                     key=lambda s: s["t"])
+        if not own:
+            continue
+        units, clean = [], []  # units: (段序号, 文本, 清稿词起点)
+        for pi, para in enumerate(p for p in re.split(r"\n\s*\n", text) if p.strip()):
+            for sent in split_sentences(" ".join(para.split())):
+                units.append((pi, sent, len(clean)))
+                clean += _TOKEN.findall(sent.lower())
+        raw = []  # (词, 时间, 所在原始句序号): 有词级时间戳用它, 否则句内按词位置线性插值
+        for k, s in enumerate(own):
+            if s.get("w"):
+                raw += [(tok, t, k) for t, word in s["w"] for tok in _TOKEN.findall(word.lower())]
+            else:
+                toks = _TOKEN.findall(s["text"].lower())
+                raw += [(tok, s["t"] + (s["end"] - s["t"]) * j / len(toks), k) for j, tok in enumerate(toks)]
+        sents = []  # (段序号, {t, text, low}, 句内各词的时间)
+        if not units or not raw or _wlen(text) / len(units) > 400:
+            pi, size, prev_end = 0, 0, own[0]["t"]
+            for s in own:
+                if size and (s["t"] - prev_end > 2 or size > 500):
+                    pi, size = pi + 1, 0
+                sents.append((pi, {"t": s["t"], "text": s["text"].strip(), "low": s.get("lp", 0) < -1.0},
+                              [t for t, _ in s.get("w") or []]))
+                size += _wlen(s["text"])
+                prev_end = s["end"]
+        else:
+            c2r = {}
+            sm = difflib.SequenceMatcher(None, [r[0] for r in raw], clean, autojunk=False)
+            for i, j, n in sm.get_matching_blocks():
+                for d in range(n):
+                    c2r[j + d] = i + d
+            matched = sorted(c2r)
+            starts = []
+            for ui, (_, _, c0) in enumerate(units):
+                c1 = units[ui + 1][2] if ui + 1 < len(units) else len(clean)
+                i = bisect.bisect_left(matched, c0)
+                if i < len(matched) and matched[i] < max(c1, c0 + 1):  # 句内第一个对上的词, 往回推到句首
+                    r = c2r[matched[i]] - (matched[i] - c0)
+                elif i > 0:  # 整句都被改写: 从前一个对上的词顺推
+                    r = c2r[matched[i - 1]] + (c0 - matched[i - 1])
+                else:
+                    r = 0
+                r = min(max(r, starts[-1] if starts else 0), len(raw) - 1)  # 时间不倒流
+                starts.append(r)
+            for ui, (pi, sent, _) in enumerate(units):
+                r0 = starts[ui]
+                r1 = starts[ui + 1] if ui + 1 < len(units) else len(raw)
+                ks = {raw[x][2] for x in range(r0, max(r1, r0 + 1))}
+                sents.append((pi, {"t": round(raw[r0][1], 1), "text": sent,
+                                   "low": any(own[k].get("lp", 0) < -1.0 for k in ks)},
+                              [raw[x][1] for x in range(r0, max(r1, r0 + 1))]))
+        # 每句归人: 先按词投票——词落在谁的说话时段里算谁一票(句中的停顿、音乐不占票);
+        # 词都落在空档里再按时段重叠算。没听出人的句子跟前一句(开头的跟后一句)
+        near = [v for v in voices or [] if v["track"] == track and v["end"] > sec and v["t"] < sec + chunk + 30]
+        who = []
+        for i, (_, sent, times) in enumerate(sents):
+            votes = {}
+            for t in times:
+                for v in near:
+                    if v["t"] - 0.2 <= t < v["end"]:
+                        votes[v["spk"]] = votes.get(v["spk"], 0) + 1
+            if not votes:
+                t0, t1 = sent["t"], sents[i + 1][1]["t"] if i + 1 < len(sents) else own[-1]["end"]
+                for v in near:
+                    cover = min(v["end"], max(t1, t0 + 0.5)) - max(v["t"], t0)
+                    if cover > 0:
+                        votes[v["spk"]] = votes.get(v["spk"], 0) + cover
+            who.append(max(votes, key=votes.get) if votes else None)
+        for i in range(1, len(who)):
+            who[i] = who[i - 1] if who[i] is None else who[i]
+        for i in range(len(who) - 2, -1, -1):
+            who[i] = who[i + 1] if who[i] is None else who[i]
+        heard = any(w is not None for w in who)
+        cur, cur_pi, size = None, None, 0
+        for (pi, sent, _), spk in zip(sents, who):
+            # 按声音: 换人另起一段, 同一人说得长了才在清稿的分段处断开; 没有声音信息: 沿用清稿的轮次
+            turn = spk != cur["spk"] or (pi != cur_pi and size > 250) if cur and heard else pi != cur_pi
+            if cur is None or turn or size > 600:
+                cur = {"speaker": label, "track": track, "spk": spk, "sents": []}
+                paras.append(cur)
+                size = 0
+            cur_pi = pi
+            cur["sents"].append(sent)
+            size += _wlen(sent["text"])
+    paras.sort(key=lambda p: (p["sents"][0]["t"], p["track"] != "sys"))
+    return paras
+
+
+def label_speakers(paras: list[dict], names: dict | None = None) -> list[str]:
+    """给按声音分出的说话人定显示名: 认出名字的用名字, 其余按出场顺序叫「发言人 A / B…」。
+    一条音轨上只听出一个人时沿用音轨原名(对方 / 本人 / 现场)。返回用到的代称字母。"""
+    order = []  # (音轨, 说话人编号), 按出场顺序
+    for p in paras:
+        key = (p["track"], p.get("spk"))
+        if key[1] is not None and key not in order:
+            order.append(key)
+    letters = {}
+    for key in order:
+        if sum(1 for k in order if k[0] == key[0]) > 1:
+            letters[key] = chr(65 + len(letters)) if len(letters) < 26 else str(len(letters) + 1)
+    for p in paras:
+        letter = letters.get((p["track"], p.get("spk")))
+        if letter:
+            p["speaker"] = (names or {}).get(letter) or f"发言人 {letter}"
+    return list(letters.values())
+
+
+def ensure_speaker_models() -> str | None:
+    """说话人模型缺哪个下哪个, sha256 校验通过才落盘; 齐了返回 None, 否则返回失败原因"""
+    for name, (url, member, sha) in SPEAKER_MODELS.items():
+        dest = MODELS_DIR / name
+        if dest.exists():
+            continue
+        try:
+            MODELS_DIR.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(dir=MODELS_DIR) as tmp:
+                part = Path(tmp) / "download"
+                with urllib.request.urlopen(url, timeout=60) as r, open(part, "wb") as f:
+                    shutil.copyfileobj(r, f)
+                if member:  # 压缩包里只取模型文件本身
+                    with tarfile.open(part) as tar, open(Path(tmp) / "model", "wb") as f:
+                        shutil.copyfileobj(tar.extractfile(member), f)
+                    part = Path(tmp) / "model"
+                if hashlib.sha256(part.read_bytes()).hexdigest() != sha:
+                    return f"{name} 校验不符"
+                part.replace(dest)
+        except Exception as exc:
+            return f"{name} 下载失败({type(exc).__name__})"
+    return None
+
+
+def match_voice(voices: list[dict], vec: list[float], dur: float) -> int | None:
+    """把一块音频里的某个说话人对到全场编号。vec 是归一化声纹, dur 是他在这块里说了多久。
+    够像已有的人就并入(并更新那人的声纹质心); 谁都不像且说满 3 秒才算新人;
+    只说了一两秒的片段声纹不稳, 对不上就不归人(返回 None), 免得凭空多出发言人。"""
+    best, sim = None, -1.0
+    for i, v in enumerate(voices):
+        cos = sum(x * y for x, y in zip(vec, v["vec"]))
+        if cos > sim:
+            best, sim = i, cos
+    brief = dur < 3
+    if best is not None and sim >= (0.4 if brief else 0.5):
+        v = voices[best]
+        if not brief:
+            mix = [x * v["dur"] + y * dur for x, y in zip(v["vec"], vec)]
+            norm = sum(x * x for x in mix) ** 0.5 or 1.0
+            v["vec"] = [x / norm for x in mix]
+        v["dur"] += dur
+        return best
+    if brief:
+        return None
+    voices.append({"vec": vec, "dur": dur})
+    return len(voices) - 1
+
+
+class SpeakerTracker:
+    """按声音分辨说话人。每块音频先在块内分出「谁在什么时候说话」, 再用声纹把块内的人对到全场统一编号,
+    逐块追加到 speakers.jsonl。全程在本机; 模型没备好或运行出错就整体停用, 不影响录音、转写与纪要。"""
+
+    def __init__(self, session: Path):
+        self.session = session
+        self.q: queue.Queue = queue.Queue()
+        self.voices: dict[str, list[dict]] = {}   # 音轨 → 全场说话人 [{vec, dur}]
+        self.sd = self.extractor = None
+        self.thread = threading.Thread(target=self.loop, daemon=True)
+
+    def load(self) -> str | None:
+        problem = ensure_speaker_models()
+        if problem:
+            return problem
+        try:
+            import sherpa_onnx as so
+            seg, emb = (str(MODELS_DIR / name) for name in SPEAKER_MODELS)
+            voice = so.SpeakerEmbeddingExtractorConfig(model=emb, num_threads=4)
+            self.sd = so.OfflineSpeakerDiarization(so.OfflineSpeakerDiarizationConfig(
+                segmentation=so.OfflineSpeakerSegmentationModelConfig(
+                    pyannote=so.OfflineSpeakerSegmentationPyannoteModelConfig(model=seg), num_threads=4),
+                embedding=voice,
+                clustering=so.FastClusteringConfig(num_clusters=-1, threshold=0.5),
+                min_duration_on=0.3, min_duration_off=0.5))
+            self.extractor = so.SpeakerEmbeddingExtractor(voice)
+        except Exception as exc:
+            return f"模型加载失败({type(exc).__name__})"
+        return None
+
+    def loop(self):
+        """后台线程: 备好模型后逐块处理, 收到 None 收工"""
+        problem = self.load()
+        log(self.session, f"说话人分辨: 已停用 — {problem}" if problem else "说话人分辨: 已就绪")
+        while True:
+            item = self.q.get()
+            if item is None:
+                return
+            if problem:
+                continue
+            try:
+                self.process(*item)
+            except Exception as exc:
+                log(self.session, f"说话人分辨失败 {item[0].name}: {type(exc).__name__}")
+
+    def process(self, wav: Path, track: str, base: int):
+        import numpy as np
+        with wave.open(str(wav)) as f:
+            rate = f.getframerate()
+            audio = np.frombuffer(f.readframes(f.getnframes()), dtype=np.int16).astype(np.float32) / 32768
+        if rate != self.sd.sample_rate or len(audio) < rate:
+            return
+        local = {}  # 块内说话人 → [(起, 止)]
+        for turn in self.sd.process(audio).sort_by_start_time():
+            local.setdefault(turn.speaker, []).append((turn.start, turn.end))
+        voices = self.voices.setdefault(track, [])
+        rows = []
+        # 说得久的先对号, 零碎片段随后才有人可对
+        for spans in sorted(local.values(), key=lambda sp: -sum(b - a for a, b in sp)):
+            longest = sorted(spans, key=lambda sp: sp[0] - sp[1])[:8]
+            clip = np.concatenate([audio[int(a * rate):int(b * rate)] for a, b in longest])[:rate * 40]
+            stream = self.extractor.create_stream()
+            stream.accept_waveform(rate, clip)
+            stream.input_finished()
+            if not self.extractor.is_ready(stream):  # 太短, 提不出声纹
+                continue
+            vec = list(self.extractor.compute(stream))
+            norm = sum(x * x for x in vec) ** 0.5 or 1.0
+            spk = match_voice(voices, [x / norm for x in vec], sum(b - a for a, b in spans))
+            if spk is not None:
+                rows += [{"t": round(base + a, 2), "end": round(base + b, 2), "track": track, "spk": spk}
+                         for a, b in spans]
+        with open(self.session / "speakers.jsonl", "a") as f:
+            for row in sorted(rows, key=lambda r: r["t"]):
+                f.write(json.dumps(row) + "\n")
+
+    def finish(self, patience: int = 600) -> bool:
+        """停录后收尾: 等排队的块处理完; 超时(比如模型还在下载)就放弃, 本场不标说话人"""
+        self.q.put(None)
+        self.thread.join(patience)
+        return not self.thread.is_alive()
 
 def log(session: Path, msg: str):
     line = f"[{datetime.datetime.now():%H:%M:%S}] {msg}"
@@ -399,6 +746,7 @@ class Pipeline:
         self.sys_ever_sound = False     # 系统音轨是否出现过声音(guard 防呆用)
         self.tap: subprocess.Popen | None = None
         self.sys_ff: subprocess.Popen | None = None
+        self.speakers: SpeakerTracker | None = None  # 按声音分辨说话人(可选)
 
     def run_llm(self, instruction: str, payload: str, model: str,
                 timeout: int, stage: str) -> str | None:
@@ -593,13 +941,15 @@ class Pipeline:
                 if not src.exists():
                     src = wav
             try:
-                r = mlx_whisper.transcribe(
-                    str(src), path_or_hf_repo=MODEL,
-                    language=None if self.args.lang == "auto" else self.args.lang,
-                    initial_prompt=INITIAL_PROMPT,
-                    condition_on_previous_text=False,  # 块间独立, 防幻觉延续
-                    verbose=None,
-                )
+                kw = dict(path_or_hf_repo=MODEL,
+                          language=None if self.args.lang == "auto" else self.args.lang,
+                          initial_prompt=INITIAL_PROMPT,
+                          condition_on_previous_text=False,  # 块间独立, 防幻觉延续
+                          verbose=None)
+                try:  # 词级时间: 审计页点句定位、按声音归人都靠它; 对齐出错就退回只要句级时间
+                    r = mlx_whisper.transcribe(str(src), word_timestamps=True, **kw)
+                except Exception:
+                    r = mlx_whisper.transcribe(str(src), **kw)
                 text = r["text"].strip()
             except Exception as e:
                 log(self.session, f"转写失败 {wav.name}: {e}")
@@ -616,21 +966,16 @@ class Pipeline:
                 log(self.session, f"丢弃 prompt 复读块 {wav.name}")
                 return
             heading = f"{label} · {self.ts_of(wav.stem)}"  # 人读标题: 说话方 · 起始时间
-            try:  # 句级时间戳落盘, 供 review.html 点句播放
-                base = int(wav.stem.split("_")[1]) * self.args.chunk
-                track = wav.stem.split("_")[0]
+            base = int(wav.stem.split("_")[1]) * self.args.chunk
+            track = wav.stem.split("_")[0]
+            try:  # 句级/词级时间戳落盘, 供 review.html 点句播放
                 with open(self.session / "timeline.jsonl", "a") as f:
-                    for s in (r.get("segments") or []):
-                        if s["text"].strip():
-                            f.write(json.dumps({
-                                "t": round(base + s["start"], 1),
-                                "end": round(base + s["end"], 1),
-                                "track": track, "speaker": label,
-                                "text": s["text"].strip(),
-                                "lp": round(s.get("avg_logprob", 0), 2),
-                            }, ensure_ascii=False) + "\n")
+                    for row in timeline_rows(r.get("segments"), base, track, label):
+                        f.write(json.dumps(row, ensure_ascii=False) + "\n")
             except Exception:
                 pass
+            if self.speakers and (track == "sys" or self.args.onsite):  # 线上会的麦克风轨只有自己, 不用分
+                self.speakers.q.put((wav, track, base))
             with open(self.raw_md, "a") as f:
                 f.write(f"\n### {heading}\n\n{text}\n")
             log(self.session, f"转写完成 {wav.name} ({time.time()-t0:.0f}s, {len(text)} 字)")
@@ -746,7 +1091,7 @@ class Pipeline:
 
     # ---------- 审计页: 转录原文点句回放 ----------
     def build_review(self):
-        """合并分块音频为整轨 m4a + 生成 review.html(点任意句从该秒播放, 低置信句标黄)"""
+        """合并分块音频为整轨 m4a + 生成 review.html(清稿正文按轮次分段, 点任意句从该处播放, 低置信句标黄)"""
         tl = self.session / "timeline.jsonl"
         if not tl.exists():
             return
@@ -781,16 +1126,63 @@ class Pipeline:
             f'<div class="tn">{names[t]}</div>'
             f'<audio controls preload="metadata" data-track="{t}" src="audio_{t}.m4a"></audio>'
             for t in tracks)
-        html = REVIEW_TEMPLATE.replace("AUDIOTAGS", audio_tags).replace(
-            "SEGDATA", json.dumps(segs, ensure_ascii=False)).replace(
-            "TITLE", f"转录审计 · {self.session.name}")
+        voices = []
+        spk_file = self.session / "speakers.jsonl"
+        if spk_file.exists():
+            voices = [json.loads(line) for line in spk_file.read_text().splitlines() if line.strip()]
+        paras = review_paragraphs(segs, self.transcript_blocks(), self.args.chunk, voices)
+        paras = [p for p in paras if p["track"] in tracks]
+        if not paras:
+            return
+        if label_speakers(paras):
+            label_speakers(paras, self.name_speakers(paras))
+        # 正文最后填入: 转录里出现占位词也不会被替换; "</" 转义防止正文截断 <script>
+        html = REVIEW_TEMPLATE.replace("TITLE", f"转录审计 · {self.session.name}").replace(
+            "AUDIOTAGS", audio_tags).replace(
+            "PARADATA", json.dumps(paras, ensure_ascii=False).replace("</", "<\\/"))
         (self.session / "review.html").write_text(html)
         log(self.session, f"审计页已生成: {self.session / 'review.html'}")
 
+    def name_speakers(self, paras: list[dict]) -> dict:
+        """让清稿模型根据内容(自我介绍、互相称呼)认出代称背后的名字 {字母: 姓名}; 认不出的留作代称"""
+        if not self.llm:
+            return {}
+        script, size = [], 0
+        for p in paras:  # 名字多半出现在开场, 取前一段就够
+            line = f"{p['speaker']}: {' '.join(s['text'] for s in p['sents'])}"
+            script.append(line)
+            size += len(line)
+            if size > 12000:
+                break
+        output = self.run_llm(NAME_PROMPT, "\n\n".join(script), self.args.model, 120, "说话人命名")
+        m = re.search(r"<out>(.*?)</out>", output or "", re.S)
+        try:
+            found = json.loads(m.group(1)) if m else {}
+        except json.JSONDecodeError:
+            return {}
+        if not isinstance(found, dict):
+            return {}
+        return {k.replace("发言人", "").strip(): v.strip() for k, v in found.items()
+                if isinstance(k, str) and isinstance(v, str) and 0 < len(v.strip()) <= 40 and "\n" not in v.strip()}
+
     # ---------- 合并 ----------
+    def transcript_blocks(self) -> list[tuple]:
+        """转录正文按块读出 [(起始秒, 说话方, 正文)]: 优先清稿版, 没有则用原始转写"""
+        src = self.live_md if self.live_md.exists() else self.raw_md
+        if not src.exists():
+            return []
+        blocks = []
+        # 兼容两代块标题: 新「### 对方 · 17:30」/ 旧「## 对方 · sys_0012」(09-02 前的场次)
+        pat = r"^#{2,3} (.+?) · (?:(\d+):(\d{2})|(?:sys|mic)_(\d{4}))\n(.*?)(?=^#{2,3} |\Z)"
+        for m in re.finditer(pat, src.read_text(), re.S | re.M):
+            sec = (int(m.group(2)) * 60 + int(m.group(3)) if m.group(2)
+                   else int(m.group(4)) * self.args.chunk)
+            if m.group(5).strip():
+                blocks.append((sec, m.group(1), m.group(5).strip()))
+        return blocks
+
     def finalize(self) -> Path:
         """full 转录 = 纯连续正文: 按时间序拼块、不保留块标题(时间戳导航在 review.html)"""
-        src = self.live_md if self.live_md.exists() else self.raw_md
         full = self.session / "transcript_full.md"
         header = (
             f"---\ndate: {datetime.date.today()}\n"
@@ -798,22 +1190,35 @@ class Pipeline:
             f"# 会议转录 {self.session.name}\n"
         )
         body = "\n(无转写内容)\n"
-        if src.exists():
-            blocks = []
-            # 兼容两代块标题: 新「### 对方 · 17:30」/ 旧「## 对方 · sys_0012」(09-02 前的场次)
-            pat = r"^#{2,3} (.+?) · (?:(\d+):(\d{2})|(?:sys|mic)_(\d{4}))\n(.*?)(?=^#{2,3} |\Z)"
-            for m in re.finditer(pat, src.read_text(), re.S | re.M):
-                label = m.group(1)
-                sec = (int(m.group(2)) * 60 + int(m.group(3)) if m.group(2)
-                       else int(m.group(4)) * self.args.chunk)
-                text = m.group(5).strip()
-                if text:
-                    blocks.append((sec, 0 if label == "对方" else 1, text))
-            blocks.sort(key=lambda b: (b[0], b[1]))  # 时间序, 同时刻系统音轨在前
-            if blocks:
-                body = "\n" + "\n\n".join(b[2] for b in blocks) + "\n"
+        blocks = self.transcript_blocks()
+        blocks.sort(key=lambda b: (b[0], 0 if b[1] == "对方" else 1))  # 时间序, 同时刻系统音轨在前
+        if blocks:
+            body = "\n" + "\n\n".join(b[2] for b in blocks) + "\n"
         full.write_text(header + body)
         return full
+
+
+def finish_session(pl: "Pipeline", threads: list) -> Path:
+    """停录后的收尾: 排空各线程 → 合并全文 → 审计页与终稿纪要并行生成; 返回完整转录路径"""
+    for t in threads:  # 转写 → 清理 → 提炼 链式排空
+        t.join()
+    full = pl.finalize()
+    if pl.speakers and not pl.speakers.finish():
+        log(pl.session, "说话人分辨: 未在限时内完成, 本场核对页不标发言人")
+        (pl.session / "speakers.jsonl").unlink(missing_ok=True)
+
+    def review():  # 审计页出错只记日志, 不拖累纪要
+        try:
+            pl.build_review()
+        except Exception as exc:
+            log(pl.session, f"审计页生成失败: {type(exc).__name__}")
+
+    side = threading.Thread(target=review)  # 音频合并 + 认人名, 与终稿纪要互不等待
+    side.start()
+    body = full.read_text().split("\n---\n", 2)[-1] if full.exists() else ""  # 去 frontmatter
+    pl.finalize_minutes(body)
+    side.join()
+    return full
 
 
 def do_stop():
@@ -845,6 +1250,7 @@ def main():
     ap.add_argument("--final-model", help="最终纪要模型(默认取设置或自动挑选; 单独指定 --model 时继承)")
     ap.add_argument("--detect", action="store_true", help="检测本机可用的模型, 输出 JSON 后退出")
     ap.add_argument("--no-clean", action="store_true", help="跳过所有 AI 清稿与纪要生成")
+    ap.add_argument("--no-speakers", action="store_true", help="不按声音分辨说话人(核对页不标发言人)")
     ap.add_argument("--out-dir", help=f"纪要与录音的保存目录(默认取设置, 否则 {DEFAULT_DIR})")
     args = ap.parse_args()
     cfg = load_config()
@@ -913,6 +1319,9 @@ def main():
             for stage, m in (("清稿/提纲", args.model), ("终稿", args.final_model))))
     notify("会议录音", "现场模式: 麦克风收音中, 把电脑放近发言者" if args.onsite else f"已开始录音 ({mode})")
 
+    if not args.no_speakers:
+        pl.speakers = SpeakerTracker(session)
+        pl.speakers.thread.start()
     threads = [
         threading.Thread(target=pl.transcribe_loop, daemon=False),
         threading.Thread(target=pl.clean_loop, daemon=False),
@@ -959,12 +1368,7 @@ def main():
                     break
             time.sleep(1)
     finally:
-        for t in threads:  # 转写 → 清理 → 提炼 链式排空
-            t.join()
-        full = pl.finalize()
-        pl.build_review()  # 音频合并+审计页, 秒级
-        body = full.read_text().split("\n---\n", 2)[-1] if full.exists() else ""  # 去 frontmatter
-        pl.finalize_minutes(body)
+        full = finish_session(pl, threads)
         PIDFILE.unlink(missing_ok=True)
         log(session, f"完成。纪要: {pl.minutes_md}  全文: {full}")
         print(f"\n会议纪要: {pl.minutes_md}")

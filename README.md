@@ -6,7 +6,8 @@ macOS 菜单栏会议录音工具：同时录系统声音（会议对方）和�
 - 默认「自动」选模型：开录前检查这台 Mac 能用哪些 AI，清稿挑快的、纪要挑最强的，不用自己配。
 - 支持 GPT、Claude，以及任何 OpenAI 兼容接口（Kimi、DeepSeek、Gemini、通义千问、智谱、OpenRouter…）；清稿和纪要可以各用一家。
 - GPT / Claude 可以走已登录的命令行（`codex` / `claude`，复用订阅），也可以填自己的 API key 按量计费。
-- 停录即出快版纪要，约两分钟后完整版自动覆盖；附点句回放的转录审计页。
+- 停录即出快版纪要，约两分钟后完整版自动覆盖。
+- 附核对页：按对话排版、标出每段是谁说的，点任意一句就从那里回放录音。
 
 ## 环境要求
 
@@ -44,7 +45,7 @@ open ~/Applications/MeetCap.app
   - **API Key**：填了哪家就直连该家 API；留空则用本机已登录的命令行。
   - **其他 AI**：见下节。
 
-每场会议一个文件夹（如 `20261029_1040/`），内含 `minutes.md`（纪要）、`transcript_full.md`（完整转录）、`review.html`（点句回放核对）和音频。
+每场会议一个文件夹（如 `20261029_1040/`），内含 `minutes.md`（纪要）、`transcript_full.md`（完整转录）、`review.html`（核对页，见下）和音频。
 
 如果不是 MacBook Pro，把 `meeting_recorder.py` 里的 `MIC_DEV` 改成 `ffmpeg -f avfoundation -list_devices true -i ""` 列出的内建麦克风名称。
 
@@ -62,6 +63,19 @@ open ~/Applications/MeetCap.app
 **下拉里放哪些模型由你决定。** 检测到的模型可能很多（Codex 账号里的旧版本、某个接口返回的几十个模型），默认只勾选每家「快 → 最强」那几档，下拉里显示为「GPT-6 Luna · 快」「Claude Fable · 最强」这样；其他 AI 默认勾选 `MODELS` 里写的，没写就勾前三个。其余收在设置的「管理…」里，随时勾上或取消，「只留推荐」恢复默认。
 
 可选模型来自实际检测：Codex 读它自己维护的账号可用清单，API key 和其他 AI 直接向接口要模型列表，Claude 命令行用 `haiku` / `sonnet` / `opus` / `fable` 这几个始终指向最新版的别名。也可以在设置里「手动填写模型名」。走 Anthropic API 时 Sonnet / Opus / Fable 遇到安全分类器拒答，会由服务端自动换模型重试。
+
+## 核对页与说话人
+
+`review.html` 用来对着录音核对转录：正文是清稿后的文字，按对话排版，一个人连续说的话是一段，段首标出是谁。点任意一句，播放器跳到那句话在录音里的位置；空格键暂停 / 继续；黄底的句子是转写把握低的地方。
+
+**谁在说话是按声音分的，不是让 AI 看文字猜的。** 录音期间每块音频在本机做一次说话人分辨（[sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)，声纹只在内存里比对，不上传也不落盘），全场统一编号，支持多人。分出人之后，再让清稿模型根据内容（自我介绍、互相称呼、主持人介绍）认名字：认得出的标名字，认不出的标「发言人 A / B…」。只听出一个人时不标代称。
+
+- 首次使用会自动下载两个模型到 `~/Library/Application Support/MeetCap/models/`，共约 34 MB，校验 sha256 后离线运行。下载失败或没下完时照常录音出纪要，只是那一场不标说话人。
+- 线上会议只分「会议声音」这一轨，麦克风轨就是你自己；现场会模式分麦克风轨。
+- 几个人同时说话、只有一两秒的插话，可能归错人或不单独成段。名字来自模型对内容的判断，重要场合请核对。
+- 不需要时加 `--no-speakers`。
+
+目前说话人标注只用在核对页上，`minutes.md` 和 `transcript_full.md` 的写法不变。
 
 ## 其他 AI（Kimi、DeepSeek、Gemini、通义千问、智谱…）
 
@@ -85,6 +99,7 @@ MODELS=快的模型名,强的模型名     # 可不填，不填就列出该接�
 ./meeting_recorder.py --model haiku --final-model gpt-6-astra
 ./meeting_recorder.py --out-dir ~/Documents/Meetings --onsite
 ./meeting_recorder.py --no-clean                             # 只做本地转录, 不调任何模型
+./meeting_recorder.py --no-speakers                          # 不按声音分辨说话人
 ./meeting_recorder.py --stop                                 # 从另一个终端停录
 ```
 
