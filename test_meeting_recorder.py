@@ -1,5 +1,7 @@
 """Text-processing smoke tests; no recording, microphone, or network calls."""
 
+import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -8,9 +10,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from meeting_recorder import (CLEAN_PROMPT, ModelRefusal, Pipeline, call_api, detect_models, label_speakers,
-                              match_voice, parse_custom, provider_of, review_paragraphs, split_sentences,
-                              timeline_rows)
+from meeting_recorder import (CLEAN_PROMPT, ModelRefusal, Pipeline, call_api, detect_models, do_stop,
+                              label_speakers, live_recordings, match_voice, parse_custom, provider_of,
+                              register_recording, resolve_app, review_paragraphs, split_sentences,
+                              start_conflict, timeline_rows, unregister_recording)
 
 
 class ModelRunnerTests(unittest.TestCase):
@@ -278,6 +281,49 @@ class ModelRunnerTests(unittest.TestCase):
                   {"t": 17.4, "end": 20.0, "track": "sys", "spk": 2}]
         paras = review_paragraphs(segs, blocks, 150, voices)
         self.assertEqual([p["spk"] for p in paras], [1, 2])
+
+    def test_recordings_can_run_side_by_side_only_when_they_cannot_bleed(self):
+        zoom, chrome = Path("/Applications/zoom.us.app"), Path("/Applications/Google Chrome.app")
+        everything = {"pid": 1, "app": None, "capturing": True}
+        zoom_only = {"pid": 2, "app": str(zoom), "capturing": True}
+        self.assertIsNone(start_conflict([], None))
+        self.assertIsNone(start_conflict([everything], zoom))            # 全部声音那场会自动扣掉 Zoom
+        self.assertIsNone(start_conflict([zoom_only], chrome))
+        self.assertIsNone(start_conflict([zoom_only], None))             # 只录 Zoom 时再开一场「其余全部」
+        self.assertIn("已有一场在录全部声音", start_conflict([everything], None))
+        self.assertIn("已经在录了", start_conflict([zoom_only], zoom))
+        # 已停录、只剩出纪要的场次不占位
+        self.assertIsNone(start_conflict([dict(everything, capturing=False)], None))
+        self.assertIsNone(start_conflict([dict(zoom_only, capturing=False)], zoom))
+
+    def test_registry_tracks_live_recordings_and_stop_targets_one_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run, app = Path(tmp) / "run", Path("/Applications/zoom.us.app")
+            with patch("meeting_recorder.RUN_DIR", run):
+                register_recording(Path(tmp) / "20261124_1030", app, mic=True)
+                me = os.getpid()
+                self.assertEqual((run / str(me)).read_text(), str(app))     # 占位文件: 供录全部声音的那场排除
+                (run / "999999.json").write_text('{"pid": 999999, "session": "/x/20261124_0900", "capturing": true}')
+                (run / "999999").write_text("/Applications/Gone.app")
+                live = live_recordings()
+                self.assertEqual([(r["pid"], r["name"], r["mic"]) for r in live], [(me, "zoom.us", True)])
+                self.assertFalse((run / "999999.json").exists() or (run / "999999").exists())  # 死进程的登记被清掉
+                with patch("meeting_recorder.os.kill") as kill:
+                    self.assertEqual(do_stop("20261124_0900"), 1)            # 没有这场: 只探活, 不发停录信号
+                    self.assertNotIn(signal.SIGINT, [c.args[1] for c in kill.call_args_list])
+                    self.assertEqual(do_stop("20261124_1030"), 0)
+                    kill.assert_called_with(me, signal.SIGINT)
+                register_recording(Path(tmp) / "20261124_1030", app, mic=False, capturing=False)
+                self.assertFalse((run / str(me)).exists())                  # 停录后不再占着应用
+                with patch("meeting_recorder.os.kill") as kill:
+                    self.assertEqual(do_stop(), 1)                           # 只剩出纪要的, 没有可停的
+                unregister_recording()
+                self.assertEqual(list(run.iterdir()), [])
+
+    def test_resolve_app_accepts_a_path_or_an_app_name(self):
+        self.assertEqual(resolve_app("/System/Applications/Calendar.app"), Path("/System/Applications/Calendar.app"))
+        self.assertEqual(resolve_app("calendar"), Path("/System/Applications/Calendar.app"))
+        self.assertIsNone(resolve_app("NoSuchAppForSure"))
 
 
 if __name__ == "__main__":

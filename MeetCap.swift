@@ -8,8 +8,26 @@ import AppKit
 
 // MARK: - 状态模型
 
+/// 一场进行中的录音(含停录后还在转写、出纪要的)。可以同时有几场: 每场只录一个应用, 声音互不串
+struct Recording: Identifiable {
+    let pid: Int32
+    let session: URL
+    let appPath: String?    // 只录的应用; nil = 全部声音
+    var state: RecorderVM.RecState = .recording
+    var elapsed = 0
+    var rms = 0.0
+    var mode = "online"
+    var id: Int32 { pid }
+    var title: String {
+        appPath.map { FileManager.default.displayName(atPath: $0).replacingOccurrences(of: ".app", with: "") }
+            ?? "全部声音"
+    }
+}
+
 final class RecorderVM: ObservableObject {
     enum RecState { case idle, recording, transcribing, summarizing }
+    @Published var recordings: [Recording] = []
+    // 菜单栏图标跟的那一场(正在录的优先); 没有录音时为 idle
     @Published var state: RecState = .idle
     @Published var elapsed: Int = 0
     @Published var rms: Double = 0
@@ -32,7 +50,8 @@ final class RecorderVM: ObservableObject {
     // 管线脚本位置由 build_app.sh 在打包时写进 Info.plist(即仓库所在目录)
     let script = Bundle.main.object(forInfoDictionaryKey: "MeetCapScript") as? String ?? ""
     var scriptMissing: Bool { !FileManager.default.isExecutableFile(atPath: script) }
-    private var pidfile: URL { home.appendingPathComponent(".meeting_recorder.pid") }
+    // 管线在这里登记每场进行中的录音: <pid>.json
+    private var runDir: URL { home.appendingPathComponent("Library/Application Support/MeetCap/run") }
 
     init() {
         reloadConfig()
@@ -44,34 +63,58 @@ final class RecorderVM: ObservableObject {
         poll()
     }
 
-    // ---- 轮询: pidfile 判活 + status.json 取状态 ----
+    // ---- 轮询: 登记处里进程还在的场次 + 各自的 status.json ----
     func poll() {
         lastSession = newestSession()
-        guard let pidStr = try? String(contentsOf: pidfile, encoding: .utf8),
-              let pid = Int32(pidStr.trimmingCharacters(in: .whitespacesAndNewlines)),
-              kill(pid, 0) == 0 else {
+        var found: [Recording] = []
+        let files = (try? FileManager.default.contentsOfDirectory(at: runDir, includingPropertiesForKeys: nil)) ?? []
+        for file in files where file.pathExtension == "json" {
+            guard let data = try? Data(contentsOf: file),
+                  let info = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let pid = (info["pid"] as? Int).map(Int32.init), kill(pid, 0) == 0,
+                  let path = info["session"] as? String else { continue }
+            var rec = Recording(pid: pid, session: URL(fileURLWithPath: path), appPath: info["app"] as? String)
+            let status = (try? Data(contentsOf: rec.session.appendingPathComponent("status.json")))
+                .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+            switch status?["state"] as? String {
+            case "transcribing", "processing":
+                rec.state = .transcribing
+            case "summarizing":
+                rec.state = .summarizing
+            default:  // 状态文件未就绪时按录音中显示; 已停录的至少算转写收尾
+                rec.state = (info["capturing"] as? Bool ?? true) ? .recording : .transcribing
+                rec.elapsed = status?["elapsed"] as? Int ?? 0
+                rec.rms = status?["rms"] as? Double ?? 0
+                rec.mode = status?["mode"] as? String ?? "online"
+            }
+            found.append(rec)
+        }
+        found.sort { $0.session.lastPathComponent < $1.session.lastPathComponent }
+        recordings = found
+        guard let lead = found.first(where: { $0.state == .recording }) ?? found.first else {
             state = .idle
             return
         }
-        // 管线活着: 细分 recording / processing
-        guard let sess = lastSession,
-              let data = try? Data(contentsOf: sess.appendingPathComponent("status.json")),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let s = obj["state"] as? String else {
-            state = .recording  // 状态文件未就绪时按录音中显示
-            return
+        state = lead.state
+        if lead.state == .recording {
+            elapsed = lead.elapsed
+            rms = lead.rms
+            mode = lead.mode
         }
-        switch s {
-        case "transcribing", "processing":
-            state = .transcribing
-        case "summarizing":
-            state = .summarizing
-        default:
-            state = .recording
-            elapsed = obj["elapsed"] as? Int ?? 0
-            rms = obj["rms"] as? Double ?? 0
-            mode = obj["mode"] as? String ?? "online"
-        }
+    }
+
+    var capturing: [Recording] { recordings.filter { $0.state == .recording } }
+
+    /// 可以单独录的应用: 正在运行的普通应用, 去掉已经在录的
+    var appChoices: [(name: String, url: URL)] {
+        let taken = Set(capturing.compactMap(\.appPath))
+        return NSWorkspace.shared.runningApplications
+            .filter { $0.activationPolicy == .regular && $0.bundleIdentifier != Bundle.main.bundleIdentifier }
+            .compactMap { app -> (name: String, url: URL)? in
+                guard let url = app.bundleURL, !taken.contains(url.resolvingSymlinksInPath().path) else { return nil }
+                return (app.localizedName ?? url.deletingPathExtension().lastPathComponent, url)
+            }
+            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }
 
     private func newestSession() -> URL? {
@@ -146,20 +189,23 @@ final class RecorderVM: ObservableObject {
         try? p.run()
     }
 
-    func startRecording() {
+    /// app 为空录全部声音; 给了应用就只录它(同时开第二场时用, 两场互不串音)
+    func startRecording(app: URL? = nil) {
         // 已检测过就把「自动」的结果直接传下去, 省掉管线开录前再检测的一两秒;
         // 没检测完则不传, 管线自己读设置并检测
         let draft = draftModel == "auto" ? detection?.auto.draft : draftModel
         let final = finalModel == "auto" ? detection?.auto.finalModel : finalModel
         var flags = (onsite ? " --onsite" : "") + (recordMic ? "" : " --no-mic")
         if let draft, let final { flags += " --model \(shq(draft)) --final-model \(shq(final))" }
+        if let app { flags += " --app \(shq(app.resolvingSymlinksInPath().path))" }
         // taskpolicy -c utility: 整条管线走效率档(效率核+低 GPU 优先级), 压发热;
         // 转写慢两三成但均为后台活, 仅停录后尾块多等十几秒
         shell("nohup taskpolicy -c utility \(shq(script))\(flags) >/dev/null 2>&1 &")
     }
 
-    func stopRecording() {
-        shell("\(shq(script)) --stop")
+    /// 给了场次只停那一场, 否则停掉所有正在录的
+    func stopRecording(_ rec: Recording? = nil) {
+        shell("\(shq(script)) --stop" + (rec.map { " \(shq($0.session.lastPathComponent))" } ?? ""))
     }
 
     func openLatestMinutes() {
@@ -178,8 +224,10 @@ final class RecorderVM: ObservableObject {
     }
 
     // ---- 展示辅助 ----
-    var elapsedText: String { String(format: "%d:%02d", elapsed / 60, elapsed % 60) }
-    var levelBar: String {
+    var elapsedText: String { Self.clock(elapsed) }
+    var levelBar: String { Self.bar(rms) }
+    static func clock(_ seconds: Int) -> String { String(format: "%d:%02d", seconds / 60, seconds % 60) }
+    static func bar(_ rms: Double) -> String {
         // rms 典型范围 0.001(静)~0.1(响), 对数映射到 0-10 格
         let db = 20 * log10(max(rms, 1e-5))            // -100 ~ -20
         let n = max(0, min(10, Int((db + 60) / 4)))    // -60dB→0 格, -20dB→10 格
@@ -558,14 +606,47 @@ struct MeetCapApp: App {
 
     var body: some Scene {
         MenuBarExtra {
-            switch vm.state {
-            case .idle:
-                if vm.scriptMissing {
-                    Text("找不到 meeting_recorder.py，请在仓库里重新运行 build_app.sh")
+            if vm.scriptMissing {
+                Text("找不到 meeting_recorder.py，请在仓库里重新运行 build_app.sh")
+            }
+            // 进行中的每一场: 状态一行, 正在录的各带一个停止按钮
+            ForEach(vm.recordings) { rec in
+                let name = vm.recordings.count > 1 || rec.appPath != nil ? "\(rec.title)：" : ""
+                switch rec.state {
+                case .recording:
+                    Text(rec.mode == "onsite"
+                         ? "\(name)现场收音中 \(RecorderVM.clock(rec.elapsed))"
+                         : (rec.rms < 0.0001
+                            ? "\(name)录音中 \(RecorderVM.clock(rec.elapsed))   (等待声音…)"
+                            : "\(name)录音中 \(RecorderVM.clock(rec.elapsed))   \(RecorderVM.bar(rec.rms))"))
+                    if vm.capturing.count > 1 {
+                        Button("停止「\(rec.title)」, 生成纪要") { vm.stopRecording(rec) }
+                    } else {
+                        Button("停止录音, 生成纪要") { vm.stopRecording(rec) }
+                            .keyboardShortcut("s")
+                    }
+                case .transcribing:
+                    Text("\(name)① 转写收尾中…")
+                case .summarizing:
+                    Text("\(name)② 纪要生成中…")
+                case .idle:
+                    EmptyView()
+                }
+            }
+            if vm.capturing.isEmpty {
+                if !vm.recordings.isEmpty {
+                    Button("打开快版纪要(如已生成)") { vm.openLatestMinutes() }
+                    Divider()
                 }
                 Button(vm.onsite ? "开始录音 (现场会)" : "开始录音") { vm.startRecording() }
                     .keyboardShortcut("r")
                     .disabled(vm.scriptMissing)
+                Menu("只录一个应用") {
+                    ForEach(vm.appChoices, id: \.url) { app in
+                        Button(app.name) { vm.startRecording(app: app.url) }
+                    }
+                }
+                .disabled(vm.scriptMissing || vm.onsite)
                 Toggle("现场会模式 (用麦克风收全场)", isOn: vm.$onsite)
                 Toggle("同时录我的麦克风", isOn: vm.$recordMic)
                     .disabled(vm.onsite)  // 现场模式强制开麦
@@ -575,20 +656,17 @@ struct MeetCapApp: App {
                     Text("清稿：\(vm.describe(vm.draftModel, auto: vm.detection?.auto.draft))")
                     Text("纪要：\(vm.describe(vm.finalModel, auto: vm.detection?.auto.finalModel))")
                 }
-            case .recording:
-                Text(vm.mode == "onsite"
-                     ? "现场收音中 \(vm.elapsedText)"
-                     : (vm.rms < 0.0001
-                        ? "录音中 \(vm.elapsedText)   (等待声音…)"
-                        : "录音中 \(vm.elapsedText)   \(vm.levelBar)"))
-                Button("停止录音, 生成纪要") { vm.stopRecording() }
-                    .keyboardShortcut("s")
-            case .transcribing:
-                Text("① 转写收尾中…")
-                Button("打开快版纪要(如已生成)") { vm.openLatestMinutes() }
-            case .summarizing:
-                Text("② 纪要生成中…")
-                Button("打开快版纪要(如已生成)") { vm.openLatestMinutes() }
+            } else {
+                // 同时听第二个会: 新开的一场只录选中的应用, 已在录全部声音的那场会自动不再收它
+                Menu("再录一个会（分开录）") {
+                    if vm.capturing.allSatisfy({ $0.appPath != nil }) {
+                        Button("其余全部声音") { vm.startRecording() }
+                        Divider()
+                    }
+                    ForEach(vm.appChoices, id: \.url) { app in
+                        Button(app.name) { vm.startRecording(app: app.url) }
+                    }
+                }
             }
             Divider()
             Button("打开最近纪要") { vm.openLatestMinutes() }
@@ -604,7 +682,8 @@ struct MeetCapApp: App {
             case .recording:
                 HStack(spacing: 2) {
                     Image(systemName: vm.mode == "onsite" ? "mic.fill" : "record.circle.fill")
-                    Text(vm.mode == "onsite" ? vm.elapsedText : "\(vm.elapsedText) \(vm.levelChar)")
+                    Text((vm.capturing.count > 1 ? "\(vm.capturing.count)场 " : "")
+                         + (vm.mode == "onsite" ? vm.elapsedText : "\(vm.elapsedText) \(vm.levelChar)"))
                         .monospacedDigit()
                 }
             case .transcribing:

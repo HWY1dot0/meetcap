@@ -44,9 +44,11 @@ INITIAL_PROMPT = ("美联储 议息会议 杰克逊霍尔 点阵图 缩表 期�
                   "Federal Reserve FOMC federal funds rate inflation labor market balance sheet basis points")
 MIC_DEV = "MacBook Pro Microphone"  # 内建麦(自己声音; 戴耳机时对方声音不外放, 此轨天然只有自己)
 DEFAULT_DIR = Path.home() / "Recordings" / "meetings"
-PIDFILE = Path.home() / ".meeting_recorder.pid"
 # MeetCap「设置…」写入; 命令行运行也读同一份
 CONFIG_FILE = Path.home() / "Library" / "Application Support" / "MeetCap" / "config.json"
+# 进行中的录音登记处, 让几场录音互相知道对方: <pid>.json = 场次信息;
+# <pid>(无后缀) = 那场只录的应用路径, 录「全部声音」的那场据此把它排除, 两场不串音
+RUN_DIR = CONFIG_FILE.parent / "run"
 # 按声音分辨说话人用的两个模型: 首次用到时下载到本机(约 34MB), 校验后离线运行
 MODELS_DIR = CONFIG_FILE.parent / "models"
 _SHERPA = "https://github.com/k2-fsa/sherpa-onnx/releases/download"
@@ -796,8 +798,10 @@ class Pipeline:
 
     # ---------- 系统音轨: audiotap → ffmpeg 分块, 顺路实时电平监控 ----------
     def start_sys_chain(self) -> bool:
+        app = getattr(self.args, "app", None)  # 只录一个应用, 否则录全部声音(扣掉别的录音占了的应用)
+        scope = ["--only", str(app)] if app else ["--exclude-from", str(RUN_DIR)]
         self.tap = subprocess.Popen(
-            [str(AUDIOTAP)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            [str(AUDIOTAP), *scope], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         line = self.tap.stderr.readline().decode().strip()
         try:
             fmt = json.loads(line)
@@ -1221,24 +1225,88 @@ def finish_session(pl: "Pipeline", threads: list) -> Path:
     return full
 
 
-def do_stop():
-    if not PIDFILE.exists():
-        print("没有正在运行的录音。")
+def live_recordings() -> list[dict]:
+    """登记处里进程还在的录音(含停录后仍在出纪要的); 顺手清掉已退出进程留下的登记"""
+    live = []
+    for f in sorted(RUN_DIR.glob("*.json")):
+        try:
+            info = json.loads(f.read_text())
+            os.kill(int(info["pid"]), 0)  # 信号 0 探活
+        except (ValueError, KeyError, TypeError, ProcessLookupError):
+            f.unlink(missing_ok=True)
+            (RUN_DIR / f.stem).unlink(missing_ok=True)
+            continue
+        except PermissionError:
+            pass  # 进程在, 只是不归我们管
+        live.append(info)
+    return live
+
+
+def register_recording(session: Path, app: Path | None, mic: bool, capturing: bool = True):
+    """登记(或更新)本进程这场录音。capturing=False 表示已停录、只剩转写和纪要: 不再占用应用"""
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    info = {"pid": os.getpid(), "session": str(session), "app": str(app) if app else None,
+            "name": app.stem if app else None, "mic": mic, "capturing": capturing}
+    tmp = RUN_DIR / f".{os.getpid()}.tmp"
+    tmp.write_text(json.dumps(info, ensure_ascii=False))
+    tmp.replace(RUN_DIR / f"{os.getpid()}.json")
+    claim = RUN_DIR / str(os.getpid())
+    if app and capturing:
+        claim.write_text(str(app))
+    else:
+        claim.unlink(missing_ok=True)
+
+
+def unregister_recording():
+    for name in (f"{os.getpid()}.json", str(os.getpid())):
+        (RUN_DIR / name).unlink(missing_ok=True)
+
+
+def resolve_app(arg: str) -> Path | None:
+    """--app 的值 → 应用路径: 可以直接给路径, 也可以给应用名(在几个常见位置里找, 不分大小写)"""
+    given = Path(arg).expanduser()
+    if given.exists():
+        return given.resolve()
+    want = arg.lower().removesuffix(".app")
+    for folder in ("/Applications", str(Path.home() / "Applications"), "/System/Applications",
+                   "/Applications/Utilities", "/System/Applications/Utilities"):
+        for app in sorted(Path(folder).glob("*.app")):
+            if app.stem.lower() == want:
+                return app
+    return None
+
+
+def start_conflict(live: list[dict], app: Path | None) -> str | None:
+    """这场录音能不能和正在录的并存: 不能就返回原因"""
+    busy = [r for r in live if r.get("capturing")]
+    if app and any(r.get("app") == str(app) for r in busy):
+        return f"{app.stem} 已经在录了(--stop 可停止)。"
+    if not app and any(not r.get("app") for r in busy):
+        return "已有一场在录全部声音; 再录一场请用 --app 指定只录哪个应用(--stop 可停止)。"
+    return None
+
+
+def do_stop(target: str = "all") -> int:
+    """停录: 默认停掉所有正在录的; 给场次文件夹名(如 20261124_1030)或 pid 只停那一场"""
+    hits = [r for r in live_recordings() if r.get("capturing")
+            and target in ("all", Path(r["session"]).name, str(r["pid"]))]
+    if not hits:
+        print("没有正在运行的录音。" if target == "all" else f"没有找到正在录的场次 {target}。")
         return 1
-    pid = int(PIDFILE.read_text().strip())
-    try:
-        os.kill(pid, signal.SIGINT)
-        print(f"已发送停录信号给 {pid}。")
-        return 0
-    except ProcessLookupError:
-        print("录音进程已不存在, 清理 pidfile。")
-        PIDFILE.unlink()
-        return 1
+    for r in hits:
+        try:
+            os.kill(int(r["pid"]), signal.SIGINT)
+            print(f"已发送停录信号给 {Path(r['session']).name}（{r.get('name') or '全部声音'}）。")
+        except ProcessLookupError:
+            pass
+    return 0
 
 
 def main():
     ap = argparse.ArgumentParser(description="会议录音+流式转写 v2 (tap 版)")
-    ap.add_argument("--stop", action="store_true", help="停止正在运行的录音")
+    ap.add_argument("--stop", nargs="?", const="all", metavar="场次",
+                    help="停止正在运行的录音; 同时录着几场时可给场次文件夹名只停一场")
+    ap.add_argument("--app", help="只录这个应用的声音(应用名或 .app 路径); 两个会分开录时每场各指定一个")
     ap.add_argument("--chunk", type=int, default=150,
                     help="分块秒数(默认 150: 短会也吃到流式加速和快版)")
     ap.add_argument("--lang", default="auto",
@@ -1273,7 +1341,7 @@ def main():
         args.no_mic = False  # 现场会唯一的声音入口就是麦克风
 
     if args.stop:
-        sys.exit(do_stop())
+        sys.exit(do_stop(args.stop))
     if not args.no_clean:
         # AI 不可用时照常录音和转写, 只是不出 AI 纪要——录音本身绝不因此失败
         problem = None if args.model and args.final_model else "没检测到可用的 AI 模型"
@@ -1291,27 +1359,40 @@ def main():
             print(msg)
             notify("会议录音", msg)
             args.no_clean = True
-    if PIDFILE.exists():
-        try:  # 信号 0 探活
-            os.kill(int(PIDFILE.read_text().strip()), 0)
-            print("已有录音在进行中(--stop 可停止)。")
+    if args.app:
+        app = resolve_app(args.app)
+        if not app:
+            print(f"找不到应用 {args.app}: 请给应用名(如 zoom.us)或 .app 的完整路径。")
             sys.exit(1)
-        except (ProcessLookupError, ValueError):
-            PIDFILE.unlink()
+        args.app = app
+    live = live_recordings()
+    problem = start_conflict(live, args.app)
+    if problem:
+        print(problem)
+        notify("会议录音", problem)
+        sys.exit(1)
+    if not args.no_mic and not args.onsite and any(r.get("capturing") and r.get("mic") for r in live):
+        args.no_mic = True  # 麦克风只跟一场: 自己的发言不重复进两份纪要
     if not AUDIOTAP.exists():
         print(f"缺少 {AUDIOTAP} — 先运行 ./build_app.sh(或 swiftc -O audiotap.swift -o audiotap)")
         sys.exit(1)
 
-    session = args.out_dir / f"{datetime.datetime.now():%Y%m%d_%H%M}"
-    session.mkdir(parents=True, exist_ok=True)
-    PIDFILE.write_text(str(os.getpid()))
+    started = datetime.datetime.now()
+    session = args.out_dir / f"{started:%Y%m%d_%H%M}"
+    while session.exists():  # 同一分钟里开了第二场: 文件夹名顺延一分钟, 保持同样的命名格式
+        started += datetime.timedelta(minutes=1)
+        session = args.out_dir / f"{started:%Y%m%d_%H%M}"
+    session.mkdir(parents=True)
+    register_recording(session, args.app, mic=not args.no_mic)
 
     pl = Pipeline(session, args)
     if not pl.start_sys_chain():
-        PIDFILE.unlink(missing_ok=True)
+        unregister_recording()
         sys.exit(1)
     mic_proc = None if args.no_mic else spawn_mic_ffmpeg(session / "mic_%04d.wav", args.chunk)
     mode = "现场会模式(麦克风收音)" if args.onsite else ("线上模式" + ("" if mic_proc else ", 麦克风关"))
+    if args.app:
+        mode += f", 只录 {args.app.stem}"
     log(session, f"开始录音 [{mode}] → {session}  (Ctrl-C 或 --stop 结束)")
     log(session, "AI: 已关闭" if args.no_clean else
         "AI: " + ", ".join(
@@ -1341,6 +1422,7 @@ def main():
         (session / "status.json").write_text(
             json.dumps({"state": "transcribing", "ts": int(time.time())}))
         log(session, "停录中: 等待录音收尾…")
+        register_recording(session, args.app, mic=False, capturing=False)  # 不再占用应用, 别的录音可接手
         if pl.tap and pl.tap.poll() is None:
             pl.tap.send_signal(signal.SIGINT)   # tap 退出 → pump 关 ffmpeg stdin → 收尾块
         if mic_proc and mic_proc.poll() is None:
@@ -1369,7 +1451,7 @@ def main():
             time.sleep(1)
     finally:
         full = finish_session(pl, threads)
-        PIDFILE.unlink(missing_ok=True)
+        unregister_recording()
         log(session, f"完成。纪要: {pl.minutes_md}  全文: {full}")
         print(f"\n会议纪要: {pl.minutes_md}")
         print(f"完整转录: {full}")
