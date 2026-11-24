@@ -124,6 +124,18 @@ MODELS=快的模型名,强的模型名     # 可不填，不填就列出该接�
 
 命令行默认读设置里的模型（未设置即「自动」）。模型名规则：`custom:模型名` 走其他 AI，Claude 别名或 `claude-*` 走 Claude，其余走 GPT。只指定 `--model` 时终稿沿用同一模型。没有可用的 AI 时照常录音和转写，只是不生成 AI 纪要。
 
+## 完成后钩子
+
+想在每场会议结束后自动做点事（把纪要归档到笔记库、发到某个地方），放一个可执行文件到 `~/Library/Application Support/MeetCap/on_done`：
+
+```sh
+#!/bin/sh
+# $1 是本场会议的文件夹，里面有 minutes.md 和 transcript_full.md
+cp "$1/minutes.md" ~/Documents/Notes/"$(basename "$1").md"
+```
+
+完整版纪要落盘后，MeetCap 以会议文件夹为唯一参数在后台运行它。没有这个文件就什么都不做；钩子出错不影响录音和纪要。删掉文件即停用。
+
 ## 隐私
 
 - 原始音频和语音识别只在本机进行。启用 AI 时，转录文字会发给所选模型。

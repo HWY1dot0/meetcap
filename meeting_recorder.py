@@ -46,6 +46,8 @@ MIC_DEV = "MacBook Pro Microphone"  # 内建麦(自己声音; 戴耳机时对方
 DEFAULT_DIR = Path.home() / "Recordings" / "meetings"
 # MeetCap「设置…」写入; 命令行运行也读同一份
 CONFIG_FILE = Path.home() / "Library" / "Application Support" / "MeetCap" / "config.json"
+# 可选: 用户自备的可执行文件, 每场会议收尾后以会话目录为参数运行(如把纪要归档到笔记库)
+ON_DONE_HOOK = CONFIG_FILE.parent / "on_done"
 # 进行中的录音登记处, 让几场录音互相知道对方: <pid>.json = 场次信息;
 # <pid>(无后缀) = 那场只录的应用路径, 录「全部声音」的那场据此把它排除, 两场不串音
 RUN_DIR = CONFIG_FILE.parent / "run"
@@ -701,6 +703,20 @@ def notify(title: str, text: str):
          f'display notification "{text}" with title "{title}"'],
         capture_output=True,
     )
+
+
+def run_on_done(session: Path):
+    """收尾后运行 on_done 钩子: 不存在或不可执行即跳过; 放后台跑, 启动失败也不影响本场结果。"""
+    if not (ON_DONE_HOOK.is_file() and os.access(ON_DONE_HOOK, os.X_OK)):
+        return
+    try:
+        subprocess.Popen([str(ON_DONE_HOOK), str(session)], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except OSError as exc:
+        log(session, f"on_done 钩子启动失败: {type(exc).__name__}")
+        return
+    log(session, f"已触发 on_done 钩子: {ON_DONE_HOOK}")
 
 
 def volume_db(wav: Path) -> tuple[float, float] | None:
@@ -1453,6 +1469,7 @@ def main():
         full = finish_session(pl, threads)
         unregister_recording()
         log(session, f"完成。纪要: {pl.minutes_md}  全文: {full}")
+        run_on_done(session)
         print(f"\n会议纪要: {pl.minutes_md}")
         print(f"完整转录: {full}")
 

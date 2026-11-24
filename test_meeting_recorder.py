@@ -12,8 +12,8 @@ from unittest.mock import MagicMock, patch
 
 from meeting_recorder import (CLEAN_PROMPT, ModelRefusal, Pipeline, call_api, detect_models, do_stop,
                               label_speakers, live_recordings, match_voice, parse_custom, provider_of,
-                              register_recording, resolve_app, review_paragraphs, split_sentences,
-                              start_conflict, timeline_rows, unregister_recording)
+                              register_recording, resolve_app, review_paragraphs, run_on_done,
+                              split_sentences, start_conflict, timeline_rows, unregister_recording)
 
 
 class ModelRunnerTests(unittest.TestCase):
@@ -180,6 +180,24 @@ class ModelRunnerTests(unittest.TestCase):
                 pipeline.finalize_minutes("这是完整转录。")
             self.assertIn("纪要未生成", pipeline.minutes_md.read_text())
             self.assertIn("未完成", notify.call_args.args[1])
+
+    def test_on_done_hook_runs_detached_with_session_dir_and_is_optional(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session, hook = Path(tmp) / "20260101_0900", Path(tmp) / "on_done"
+            session.mkdir()
+            with patch("meeting_recorder.ON_DONE_HOOK", hook), \
+                 patch("meeting_recorder.subprocess.Popen") as popen:
+                run_on_done(session)                      # 没有钩子: 什么都不做
+                hook.write_text("#!/bin/sh\n")
+                run_on_done(session)                      # 有文件但不可执行: 仍不运行
+                popen.assert_not_called()
+                hook.chmod(0o700)
+                run_on_done(session)
+                self.assertEqual(popen.call_args.args[0], [str(hook), str(session)])
+                self.assertTrue(popen.call_args.kwargs["start_new_session"])
+                popen.side_effect = OSError("boom")
+                run_on_done(session)                      # 启动失败只记日志, 不抛异常
+            self.assertIn("启动失败", (session / "log.txt").read_text())
 
     def test_review_page_follows_cleaned_turns_and_maps_sentences_to_audio(self):
         segs = [
