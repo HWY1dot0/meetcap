@@ -166,3 +166,9 @@ python3 -m unittest -v test_meeting_recorder.py
 ```
 
 只测文本处理与模型调用的组装，不录音、不联网。
+
+## 许可证
+
+[PolyForm Noncommercial 1.0.0](LICENSE.md)：个人使用和非商业用途免费，可以自由使用、修改和分发。
+
+用于商业目的（包括在公司或营利性机构的工作中使用、集成到商业产品或服务里）需要另行取得授权，请[开一个 issue](https://github.com/HWY1dot0/meetcap/issues) 联系。

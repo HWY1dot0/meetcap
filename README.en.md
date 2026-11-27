@@ -168,3 +168,9 @@ python3 -m unittest -v test_meeting_recorder.py
 ```
 
 These cover only text processing and how model calls are assembled. They do not record audio or touch the network.
+
+## License
+
+[PolyForm Noncommercial 1.0.0](LICENSE.md): free for personal and noncommercial use. You may use, modify and distribute it for those purposes.
+
+Commercial use (including use in your work at a company or other for-profit organization, or building it into a commercial product or service) requires a separate license. Please [open an issue](https://github.com/HWY1dot0/meetcap/issues) to get in touch.
