@@ -1,5 +1,24 @@
 Required Notice: Copyright (c) 2026 HWY1dot0 (https://github.com/HWY1dot0)
 
+MeetCap is licensed under the PolyForm Noncommercial License 1.0.0, reproduced unchanged below, together with the additional permission that follows.
+
+# Additional Permission: Individual Use at Work
+
+The licensor grants this permission in addition to the PolyForm Noncommercial License 1.0.0. It adds to your licenses under those terms and takes nothing away from them.
+
+An individual may install and use the software, on their own initiative, on a computer they personally use, including for the work they do for an employer, a client, or their own business. Use of this kind is a permitted purpose.
+
+This additional permission does not cover, and a separate commercial license from the licensor is required for:
+
+- an organization installing, distributing, provisioning, or managing the software for the people who work for it, or requiring or directing them to use it;
+- offering the software, or a product or service that includes it or is based on it, to others for a fee or as part of a commercial offering.
+
+Every other term of the PolyForm Noncommercial License 1.0.0, including Notices, Patent Defense, Violations, and No Liability, applies to use under this additional permission.
+
+To ask about a commercial license, open an issue at <https://github.com/HWY1dot0/meetcap/issues>.
+
+---
+
 # PolyForm Noncommercial License 1.0.0
 
 <https://polyformproject.org/licenses/noncommercial/1.0.0>

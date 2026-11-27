@@ -169,6 +169,12 @@ python3 -m unittest -v test_meeting_recorder.py
 
 ## 许可证
 
-[PolyForm Noncommercial 1.0.0](LICENSE.md)：个人使用和非商业用途免费，可以自由使用、修改和分发。
+[PolyForm Noncommercial 1.0.0，外加一条额外许可](LICENSE.md)。可以自由使用、修改和分发，范围是：
 
-用于商业目的（包括在公司或营利性机构的工作中使用、集成到商业产品或服务里）需要另行取得授权，请[开一个 issue](https://github.com/HWY1dot0/meetcap/issues) 联系。
+- **个人使用免费，包括工作中使用。** 自己决定装在自己用的电脑上，录工作会议、客户会议都可以，不需要授权。
+- **非商业用途免费。** 学习、研究、爱好，以及学校、公益和政府机构使用。
+
+以下情况需要另行取得商业授权，请[开一个 issue](https://github.com/HWY1dot0/meetcap/issues) 联系：
+
+- **公司统一部署。** 由公司或机构给员工安装、分发、统一管理，或要求员工使用。
+- **拿去做生意。** 把 MeetCap 或基于它的产品、服务收费提供给别人，或集成进商业产品。

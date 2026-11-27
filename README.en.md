@@ -171,6 +171,12 @@ These cover only text processing and how model calls are assembled. They do not 
 
 ## License
 
-[PolyForm Noncommercial 1.0.0](LICENSE.md): free for personal and noncommercial use. You may use, modify and distribute it for those purposes.
+[PolyForm Noncommercial 1.0.0 plus one additional permission](LICENSE.md). You may use, modify and distribute MeetCap within these bounds:
 
-Commercial use (including use in your work at a company or other for-profit organization, or building it into a commercial product or service) requires a separate license. Please [open an issue](https://github.com/HWY1dot0/meetcap/issues) to get in touch.
+- **Free for individuals, including at work.** If you decide yourself to install it on a computer you use, you can record work and client meetings with it. No license needed.
+- **Free for noncommercial purposes.** Study, research, hobby use, and use by schools, charities and government institutions.
+
+A separate commercial license is required for the following. Please [open an issue](https://github.com/HWY1dot0/meetcap/issues) to get in touch.
+
+- **Company deployment.** A company or organization installing, distributing or managing MeetCap for its staff, or requiring them to use it.
+- **Commercial offerings.** Offering MeetCap, or a product or service built on it, to others for a fee, or building it into a commercial product.
