@@ -261,6 +261,7 @@ struct Detection: Decodable {
     let channels: [String: Channel]
     let models: [Model]
     let auto: Auto
+    let template: String?    // 内置的默认纪要格式, 「填入默认格式」用
 }
 
 // MARK: - 设置(与 meeting_recorder.py 共用一份 JSON)
@@ -296,6 +297,8 @@ struct SettingsView: View {
     @State private var openaiKey = ""
     @State private var anthropicKey = ""
     @State private var customEnv = ""
+    @State private var template = ""   // 自己的纪要模版; 空 = 内置的研究纪要格式
+    @State private var vocab = ""      // 常出现的专有名词; 空 = 内置的宏观金融词汇
     @State private var draftChoice = "auto"
     @State private var finalChoice = "auto"
     @State private var draftTyped = ""
@@ -316,6 +319,83 @@ struct SettingsView: View {
         ("智谱 GLM", "https://open.bigmodel.cn/api/paas/v4", "https://open.bigmodel.cn"),
         ("腾讯混元", "https://api.hunyuan.cloud.tencent.com/v1", "https://console.cloud.tencent.com/hunyuan"),
         ("OpenRouter（一个 key 用多家模型）", "https://openrouter.ai/api/v1", "https://openrouter.ai/keys"),
+    ]
+    // 纪要模版示例: 填进去就能用, 也可以在此基础上改
+    private static let templates = [
+        ("项目例会（结论 / 待办 / 风险）", """
+            # 用一句话写出这次会最重要的结论
+
+            ## 结论与决定
+            每条一句，写清决定了什么、由谁拍板。
+
+            ## 待办
+            用表格：事项｜负责人｜截止时间。会上没说负责人或时间的，填「未定」。
+
+            ## 风险与分歧
+            还没谈拢的问题、各方的不同意见，各写一条。
+
+            ## 下次会议
+            时间和要带来的东西。会上没提就写「无」。
+            """),
+        ("客户沟通（诉求 / 顾虑 / 下一步）", """
+            # 用一句话写出客户这次最关心的事
+
+            ## 客户背景
+            公司、对方参会人和角色。
+
+            ## 客户的诉求
+            按重要程度排列，每条写清对方的原话意思和背后的原因。
+
+            ## 顾虑与异议
+            对方担心什么、对价格或方案提了哪些异议，以及我方当场怎么回应的。
+
+            ## 下一步
+            双方各自答应做什么，什么时候做完。
+            """),
+        ("访谈 / 调研（发现 / 原话）", """
+            # 用一句话写出这次访谈最重要的发现
+
+            ## 受访者
+            身份、背景，一两句话。
+
+            ## 关键发现
+            3 到 6 条，每条先写结论，再写受访者是怎么说的。
+
+            ## 值得引用的原话
+            逐字摘 3 到 5 句最有代表性的话，用引用格式。
+
+            ## 没问清的问题
+            下次需要追问的地方。
+            """),
+        ("课程 / 讲座（知识点 / 例子）", """
+            # 这堂课的主题
+
+            ## 知识点
+            按讲课顺序分小节，每个知识点先写定义或结论，再写讲者的解释。
+
+            ## 例子与类比
+            讲者举的例子，各写一条。
+
+            ## 讲者推荐的资料
+            书、文章、工具。没有就写「无」。
+
+            ## 我没听懂的地方
+            讲得快或含糊的部分，标出来方便回看录音。
+            """),
+        ("English minutes", """
+            Write the minutes in English, even if the meeting was in another language.
+
+            # One-sentence takeaway
+
+            ## Key points
+            3 to 7 bullets. Lead each with the conclusion in bold, then the supporting facts and numbers.
+
+            ## Discussion
+            One section per speaker or topic, in full paragraphs that follow the reasoning.
+
+            ## Action items
+            Owner and deadline for each. Write "None" if there were none.
+            """),
     ]
     // 让用户把这段话发给自己常用的 AI, 由它告诉用户该填什么
     private static let helpPrompt = """
@@ -379,6 +459,31 @@ struct SettingsView: View {
             } footer: {
                 Text("填了哪家就直连该家 API、按量计费；留空则用本机已登录的 codex / claude 命令行。"
                      + "Key 只保存在本机 ~/Library/Application Support/MeetCap/config.json，仅你的账户可读。")
+                    .foregroundStyle(.secondary)
+            }
+            Section {
+                HStack {
+                    Menu("填入示例") {
+                        if let builtin = vm.detection?.template {
+                            Button("默认格式（研究纪要，可在此基础上改）") { template = builtin }
+                            Divider()
+                        }
+                        ForEach(Self.templates, id: \.0) { name, text in
+                            Button(name) { template = text }
+                        }
+                    }
+                    .fixedSize()
+                    Spacer()
+                    Button("恢复默认") { template = "" }.disabled(template.isEmpty)
+                }
+                TextEditor(text: $template)
+                    .frame(height: 130)
+                TextField("常出现的专有名词", text: $vocab, prompt: Text("用逗号分隔，如：公司名、产品名、人名、行业术语"))
+            } header: {
+                Text("纪要模版")
+            } footer: {
+                Text("想让纪要长什么样，就在上面写出来：可以是几句要求，也可以是一份带标题的骨架。留空就用内置的研究纪要格式。"
+                     + "专有名词用来减少听错的词，留空则用内置的宏观金融词汇。")
                     .foregroundStyle(.secondary)
             }
             Section {
@@ -486,6 +591,8 @@ struct SettingsView: View {
         openaiKey = cfg["openai_api_key"] ?? ""
         anthropicKey = cfg["anthropic_api_key"] ?? ""
         customEnv = cfg["custom_env"] ?? ""
+        template = cfg["minutes_template"] ?? ""
+        vocab = cfg["vocab"] ?? ""
         savedEnabled = cfg["enabled_models"]
         editedEnabled = nil
         draftChoice = cfg["draft_model"] ?? "auto"
@@ -519,6 +626,7 @@ struct SettingsView: View {
             try MeetCapConfig.save(["output_dir": outputDir, "speaker": speaker,
                                     "openai_api_key": openaiKey, "anthropic_api_key": anthropicKey,
                                     "custom_env": customEnv,
+                                    "minutes_template": template, "vocab": vocab,
                                     // 一个都不勾时存 "-", 否则空值会被当成「没勾过」而回到推荐
                                     "enabled_models": editedEnabled.map { $0.isEmpty ? "-" : $0.sorted().joined(separator: ",") }
                                         ?? savedEnabled ?? "",

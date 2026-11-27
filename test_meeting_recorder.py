@@ -10,10 +10,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from meeting_recorder import (CLEAN_PROMPT, ModelRefusal, Pipeline, call_api, detect_models, do_stop,
-                              label_speakers, live_recordings, match_voice, parse_custom, provider_of,
+from meeting_recorder import (CLEAN_PROMPT, DEFAULT_TEMPLATE, FINAL_PROMPT, INITIAL_PROMPT, ModelRefusal, Pipeline,
+                              call_api, clean_prompt, detect_models, do_stop, final_prompt, label_speakers, live_recordings, match_voice, parse_custom, provider_of,
                               register_recording, resolve_app, review_paragraphs, run_on_done,
-                              split_sentences, start_conflict, timeline_rows, unregister_recording)
+                              split_sentences, start_conflict, timeline_rows, unregister_recording, vocab_terms, whisper_prompt)
 
 
 class ModelRunnerTests(unittest.TestCase):
@@ -342,6 +342,36 @@ class ModelRunnerTests(unittest.TestCase):
         self.assertEqual(resolve_app("/System/Applications/Calendar.app"), Path("/System/Applications/Calendar.app"))
         self.assertEqual(resolve_app("calendar"), Path("/System/Applications/Calendar.app"))
         self.assertIsNone(resolve_app("NoSuchAppForSure"))
+
+    def test_custom_template_replaces_only_the_format_part_of_the_final_prompt(self):
+        self.assertEqual(final_prompt(), FINAL_PROMPT)
+        self.assertEqual(final_prompt("   "), FINAL_PROMPT)                # 只有空白 = 没填
+        self.assertIn(DEFAULT_TEMPLATE, FINAL_PROMPT)
+        custom = final_prompt("## 结论\n## 待办：事项｜负责人｜截止时间")
+        self.assertIn("<template>\n## 结论\n## 待办：事项｜负责人｜截止时间\n</template>", custom)
+        self.assertNotIn("要点速览", custom)                               # 默认格式整段让位
+        self.assertTrue(custom.startswith(FINAL_PROMPT[:30]))             # 任务说明不变
+        self.assertTrue(custom.endswith("只输出 <minutes> 与 </minutes> 标签之间的内容, 标签外不写任何内容。"))
+
+    def test_vocabulary_feeds_recognition_cleanup_and_minutes(self):
+        self.assertEqual(vocab_terms(" 寒武纪， 昇腾、Megaspeed;寒武纪\nJoe  Weisenthal "),
+                         ["寒武纪", "昇腾", "Megaspeed", "Joe Weisenthal"])
+        self.assertEqual(whisper_prompt(None), INITIAL_PROMPT)            # 没填: 内置词汇
+        self.assertEqual(clean_prompt(None), CLEAN_PROMPT)
+        self.assertEqual(whisper_prompt("寒武纪, 昇腾"), "寒武纪 昇腾")
+        for prompt in (clean_prompt("寒武纪, 昇腾"), final_prompt(None, "寒武纪, 昇腾")):
+            self.assertIn("寒武纪、昇腾", prompt)
+            self.assertNotIn("久期", prompt)                               # 内置的金融纠错规则不再混进来
+
+    def test_finalize_minutes_sends_the_users_template(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline = self.pipeline(Path(tmp))
+            pipeline.args.template, pipeline.args.vocab = "## 待办", "昇腾"
+            with patch.object(pipeline, "run_llm", return_value="<minutes>" + "## 待办\n- 无\n" * 10 + "</minutes>") as run, \
+                 patch("meeting_recorder.notify"):
+                pipeline.finalize_minutes("这是完整转录。")
+            self.assertEqual(run.call_args.args[0], final_prompt("## 待办", "昇腾"))
+            self.assertIn("## 待办", pipeline.minutes_md.read_text())
 
 
 if __name__ == "__main__":

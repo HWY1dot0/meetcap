@@ -211,7 +211,8 @@ def detect_models(cfg: dict) -> dict:
     fallback = {"draft": first[0], "final": first[-1]}
     auto = {stage: next((m for m in prefs if m in ids), fallback[stage])
             for stage, prefs in AUTO_PREFS.items()}
-    return {"channels": channels, "models": models, "auto": auto}
+    # template: 默认纪要格式的原文, 设置界面「填入默认格式」用
+    return {"channels": channels, "models": models, "auto": auto, "template": DEFAULT_TEMPLATE}
 
 
 class ModelRefusal(Exception):
@@ -262,11 +263,15 @@ DIGEST_PROMPT = (
     "只输出 <state> 与 </state> 标签之间的状态文档, 标签外不写任何内容。"
 )
 
-FINAL_PROMPT = (
+# 纪要终稿的指令 = 开头(任务与输入) + 词汇提示 + 格式(默认格式, 或用户在设置里填的模版) + 结尾(输出规则)
+FINAL_HEAD = (
     "你是会议纪要终稿撰写人。输入分两部分: 会议的完整转录全文, 以及录音期间滚动生成的要点提纲"
     "(提纲仅作线索, 一切以全文为准)。转录可能含同音错字, 按上下文理解; "
-    "高频陷阱: 金融语境中「97」常是「久期」的误转, 按搭配判断, 真实数值如「美元指数97」不动。"
-    "请通读全文后产出终版纪要, 写给没参会、事后要靠它理解这场会的专业读者。markdown 结构: "
+)
+FINAL_VOCAB = "高频陷阱: 金融语境中「97」常是「久期」的误转, 按搭配判断, 真实数值如「美元指数97」不动。"
+# 没填模版时的默认格式: 对齐专业研究纪要。设置里「填入默认格式」给用户看的也是这段
+DEFAULT_TEMPLATE = (
+    "写给没参会、事后要靠它理解这场会的专业读者。markdown 结构: "
     "「# 标题」一句话说清本场最重要的主张, 不写会议名加日期; "
     "标题下一行斜体写场合、发言人和录音覆盖范围; "
     "「## 要点速览」3-7 条, 每条以加粗的简短判断起头, 随后交代事实、条件或理由, 数字写进句子; "
@@ -279,14 +284,16 @@ FINAL_PROMPT = (
     "文字要求: 标点一律全角; 数字一律阿拉伯数字; 先记住事实再用中文说一遍, 不照搬口语的句式; "
     "速览和正文各有分工, 同一要点不写两遍; 发言人的预测和主观评价写成判断语气, 区分事实与判断; "
     "主持人提出、发言人没有接话的内容注明是主持人的。平实克制, 不加戏不拔高。"
-    "只输出 <minutes> 与 </minutes> 标签之间的内容, 标签外不写任何内容。"
 )
+FINAL_TAIL = "只输出 <minutes> 与 </minutes> 标签之间的内容, 标签外不写任何内容。"
 
-CLEAN_PROMPT = (
-    "你是会议转录清理器。下面是一段语音转写文本, 修复同音错字"
+CLEAN_HEAD = "你是会议转录清理器。下面是一段语音转写文本, 修复同音错字"
+CLEAN_VOCAB = (
     "(如 议席会议→议息会议、捷克逊霍尔→杰克逊霍尔、PCB→PCE 这类)。"
     "高频陷阱: 金融语境中「97」若出现在 供给/超配/错配/风险敞口 等搭配旁, "
     "大概率是「久期」的误转, 按上下文改回; 但「美元指数97」这类真实数值不动。"
+)
+CLEAN_TAIL = (
     "去掉无意义的口头禅和机械重复, 规整标点与分段。"
     "块内如有明显的转写故障片段(与会议内容毫无关联的新闻腔或客套话插入句、"
     "单字机械重复、乱码), 删掉那些片段即可——其余内容必须全部保留。"
@@ -296,6 +303,46 @@ CLEAN_PROMPT = (
     "标签外不写任何内容。如果删完故障片段后什么都不剩, 输出 <out></out>。"
 )
 
+
+def vocab_terms(vocab: str | None) -> list[str]:
+    """设置里填的专有名词 → 词表: 逗号、顿号、分号或换行分隔, 去重, 最多 60 个"""
+    terms = []
+    for term in re.split(r"[,，、;；\n]+", vocab or ""):
+        term = " ".join(term.split())
+        if term and term not in terms:
+            terms.append(term)
+    return terms[:60]
+
+
+def whisper_prompt(vocab: str | None = None) -> str:
+    """给语音识别的引导词: 用户填了专有名词就用它们, 否则用内置的宏观金融词汇"""
+    terms = vocab_terms(vocab)
+    return " ".join(terms)[:400] if terms else INITIAL_PROMPT
+
+
+def clean_prompt(vocab: str | None = None) -> str:
+    terms = vocab_terms(vocab)
+    hint = (f"。本场常出现的专有名词: {'、'.join(terms)}。转写里发音相近的错词按它们改回, 名单之外的词不要硬套。"
+            if terms else CLEAN_VOCAB)
+    return CLEAN_HEAD + hint + CLEAN_TAIL
+
+
+def final_prompt(template: str | None = None, vocab: str | None = None) -> str:
+    """终稿指令。template 是用户自己的纪要模版(几句要求, 或一份带标题的骨架), 没有就用默认格式"""
+    terms = vocab_terms(vocab)
+    hint = (f"本场常出现的专有名词: {'、'.join(terms)}, 发音相近的错词按它们理解。" if terms else FINAL_VOCAB)
+    template = (template or "").strip()[:4000]
+    if not template:
+        return FINAL_HEAD + hint + "请通读全文后产出终版纪要, " + DEFAULT_TEMPLATE + FINAL_TAIL
+    return (FINAL_HEAD + hint + "请通读全文后产出终版纪要。纪要的结构和写法完全按下面这份用户模版来: "
+            "它可能是几句要求, 也可能是一份带标题的骨架; 是骨架就沿用它的标题和顺序, "
+            "转录里没有对应内容的小节写「无」。\n<template>\n" + template + "\n</template>\n"
+            "模版没规定的地方: 用 markdown, 忠于转录, 不添加原文没有的信息, 把事实和发言人的判断分开写。"
+            + FINAL_TAIL)
+
+
+FINAL_PROMPT = final_prompt()
+CLEAN_PROMPT = clean_prompt()
 
 NAME_PROMPT = (
     "下面是一段已经按声音分好说话人的会议转录, 说话人暂用「发言人 A」「发言人 B」这样的代称。"
@@ -940,6 +987,7 @@ class Pipeline:
 
     def transcribe_loop(self):
         import mlx_whisper  # 首次 import 加载较慢, 放线程里不挡起录
+        prompt = whisper_prompt(getattr(self.args, "vocab", None))
 
         def do_chunk(wav: Path, label: str):
             t0 = time.time()
@@ -963,7 +1011,7 @@ class Pipeline:
             try:
                 kw = dict(path_or_hf_repo=MODEL,
                           language=None if self.args.lang == "auto" else self.args.lang,
-                          initial_prompt=INITIAL_PROMPT,
+                          initial_prompt=prompt,
                           condition_on_previous_text=False,  # 块间独立, 防幻觉延续
                           verbose=None)
                 try:  # 词级时间: 审计页点句定位、按声音归人都靠它; 对齐出错就退回只要句级时间
@@ -982,7 +1030,7 @@ class Pipeline:
                 return
             # prompt 复读过滤: whisper 解码塌缩时会原样吐出引导词串, 属确定性故障
             norm = lambda s: re.sub(r"[\s,，。、]+", "", s)
-            if norm(text) and norm(text) in norm(INITIAL_PROMPT):
+            if norm(text) and norm(text) in norm(prompt):
                 log(self.session, f"丢弃 prompt 复读块 {wav.name}")
                 return
             heading = f"{label} · {self.ts_of(wav.stem)}"  # 人读标题: 说话方 · 起始时间
@@ -1029,7 +1077,8 @@ class Pipeline:
             # 短块直接保留: 无清理收益, 且孤立短句易被清理层误判为故障块;
             # 停录后也直接保留原文, 把停录到出稿的等待压到只剩终稿化一次调用
             if self.llm and len(text) >= 30 and not self.stop_flag.is_set():
-                output = self.run_llm(CLEAN_PROMPT, text, self.args.model, 180, "清理")
+                output = self.run_llm(clean_prompt(getattr(self.args, "vocab", None)),
+                                      text, self.args.model, 180, "清理")
                 m = re.search(r"<out>(.*?)</out>", output or "", re.S)
                 if m:
                     body = m.group(1).strip()
@@ -1087,7 +1136,8 @@ class Pipeline:
         if self.llm and (full_body.strip() or self.digest_state):
             payload = (f"[完整转录全文]\n{full_body.strip() or '(无)'}\n\n"
                        f"[要点提纲(录音期间滚动生成, 仅作线索)]\n{self.digest_state or '(无)'}")
-            output = self.run_llm(FINAL_PROMPT, payload, self.args.final_model, 600, "终稿化")
+            prompt = final_prompt(getattr(self.args, "template", None), getattr(self.args, "vocab", None))
+            output = self.run_llm(prompt, payload, self.args.final_model, 600, "终稿化")
             m = re.search(r"<minutes>(.*?)</minutes>", output or "", re.S)
             if m and len(m.group(1).strip()) > 50:
                 head = m.group(1).strip()
@@ -1335,12 +1385,22 @@ def main():
     ap.add_argument("--detect", action="store_true", help="检测本机可用的模型, 输出 JSON 后退出")
     ap.add_argument("--no-clean", action="store_true", help="跳过所有 AI 清稿与纪要生成")
     ap.add_argument("--no-speakers", action="store_true", help="不按声音分辨说话人(核对页不标发言人)")
+    ap.add_argument("--template", help="纪要模版文件(几句格式要求或一份带标题的骨架); 默认取设置, 没有则用内置格式")
     ap.add_argument("--out-dir", help=f"纪要与录音的保存目录(默认取设置, 否则 {DEFAULT_DIR})")
     args = ap.parse_args()
     cfg = load_config()
     out_dir = args.out_dir or cfg.get("output_dir")
     args.out_dir = Path(out_dir).expanduser() if out_dir else DEFAULT_DIR
     args.speaker = cfg.get("speaker") or "本人"
+    args.vocab = cfg.get("vocab")
+    if args.template:
+        try:
+            args.template = Path(args.template).expanduser().read_text()
+        except OSError:
+            print(f"读不到模版文件 {args.template}")
+            sys.exit(1)
+    else:
+        args.template = cfg.get("minutes_template")
     args.api_keys = {"codex": cfg.get("openai_api_key"), "claude": cfg.get("anthropic_api_key"),
                      "custom": parse_custom(cfg.get("custom_env"))}
     if args.detect:
@@ -1414,6 +1474,9 @@ def main():
         "AI: " + ", ".join(
             f"{stage}={m}({pl.llm[provider_of(m)][0]})"
             for stage, m in (("清稿/提纲", args.model), ("终稿", args.final_model))))
+    if (args.template or "").strip() or vocab_terms(args.vocab):
+        log(session, "纪要模版: " + ("自定义" if (args.template or "").strip() else "默认")
+            + f", 专有名词 {len(vocab_terms(args.vocab))} 个")
     notify("会议录音", "现场模式: 麦克风收音中, 把电脑放近发言者" if args.onsite else f"已开始录音 ({mode})")
 
     if not args.no_speakers:
